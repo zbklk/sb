@@ -5,8 +5,9 @@
 # POSIX sh compatible: dash / ash / bash.
 
 set -u
+umask 022
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 CONFIG_FILE="/etc/sysctl.d/99-zz-vps-optimize.conf"
@@ -17,6 +18,7 @@ SYSTEMD_USER_LIMITS="/etc/systemd/user.conf.d/99-vps-optimize.conf"
 PROFILE_FILE="/etc/profile.d/99-vps-optimize.sh"
 STATE_DIR="/var/lib/vps-optimize"
 BACKUP_DIR="$STATE_DIR/backups"
+LOCK_DIR="$STATE_DIR/lock"
 
 ACTION="apply"
 PROFILE="auto"
@@ -25,6 +27,7 @@ RTT_MS=""
 BUFFER_OVERRIDE_MIB=""
 DRY_RUN="0"
 NO_LIMITS="0"
+LOCK_HELD="0"
 
 GREEN="$(printf '\033[32m')"
 YELLOW="$(printf '\033[33m')"
@@ -37,7 +40,7 @@ error() { printf "%s[ERROR]%s %s\n" "$RED" "$RESET" "$*" >&2; }
 
 usage() {
     cat <<'USAGE'
-VPS Network Optimizer 2.0
+VPS Network Optimizer 2.1
 
 用法：
   sh optimize.sh [选项]
@@ -56,15 +59,18 @@ VPS Network Optimizer 2.0
   --profile auto|small|balanced|performance
   --bandwidth N       iperf3 单流有效带宽，单位 Mbps
   --rtt N             实际使用路径的往返延迟，单位 ms
-  --buffer-mib N      手动指定最大 socket/TCP 缓冲区，4-512 MiB
+  --buffer-mib N      手动指定最大 socket/TCP 缓冲区，4-256 MiB（仍受安全上限约束）
   --no-limits         不修改文件句柄限制
   --dry-run           仅显示将采用的配置，不写入系统
   --status            显示当前状态
+  --verify            核对持久化配置、运行时 sysctl 与 qdisc 状态
   --restore           恢复最近一次运行前的配置
   -h, --help          显示帮助
 
 说明：
   --bandwidth 和 --rtt 必须同时使用。
+  不提供 RTT 时使用 profile 基线，不会假设固定 RTT。
+  默认路径不会设置 HTB 整形、initcwnd/initrwnd 或 netdev budget。
   本脚本不会更换内核，也不会强制修改容器宿主机参数。
 USAGE
 }
@@ -111,6 +117,10 @@ parse_args() {
                 ACTION="status"
                 shift
                 ;;
+            --verify)
+                ACTION="verify"
+                shift
+                ;;
             --restore)
                 ACTION="restore"
                 shift
@@ -145,11 +155,52 @@ parse_args() {
 
     if [ -n "$BUFFER_OVERRIDE_MIB" ]; then
         is_uint "$BUFFER_OVERRIDE_MIB" || { error "--buffer-mib 必须是整数。"; exit 2; }
-        if [ "$BUFFER_OVERRIDE_MIB" -lt 4 ] || [ "$BUFFER_OVERRIDE_MIB" -gt 512 ]; then
-            error "--buffer-mib 范围为 4-512 MiB。"
+        if [ "$BUFFER_OVERRIDE_MIB" -lt 4 ] || [ "$BUFFER_OVERRIDE_MIB" -gt 256 ]; then
+            error "--buffer-mib 范围为 4-256 MiB。"
             exit 2
         fi
     fi
+}
+
+release_lock() {
+    [ "$LOCK_HELD" = "1" ] || return 0
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD="0"
+}
+
+handle_signal() {
+    release_lock
+    trap - EXIT HUP INT TERM
+    exit 130
+}
+
+acquire_lock() {
+    mkdir -p "$STATE_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf "%s\n" "$$" > "$LOCK_DIR/pid"
+        LOCK_HELD="1"
+        trap 'release_lock' EXIT
+        trap 'handle_signal' HUP INT TERM
+        return 0
+    fi
+
+    holder="$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if is_uint "$holder" && kill -0 "$holder" 2>/dev/null; then
+        error "另一个优化任务正在运行（PID $holder）。"
+        exit 1
+    fi
+
+    # Only remove the two exact lock artifacts after proving that no live holder exists.
+    rm -f "$LOCK_DIR/pid"
+    if ! rmdir "$LOCK_DIR" 2>/dev/null || ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        error "无法获取任务锁：$LOCK_DIR"
+        exit 1
+    fi
+    printf "%s\n" "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD="1"
+    trap 'release_lock' EXIT
+    trap 'handle_signal' HUP INT TERM
 }
 
 trim() {
@@ -313,11 +364,14 @@ detect_bbr() {
 
 choose_qdisc() {
     QDISC=""
+    QDISC_ORIGINAL=""
 
     if [ "$DRY_RUN" = "1" ]; then
         QDISC="fq"
         return
     fi
+
+    QDISC_ORIGINAL="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
 
     if command -v modprobe >/dev/null 2>&1; then
         modprobe sch_fq >/dev/null 2>&1 || true
@@ -334,6 +388,10 @@ choose_qdisc() {
         QDISC="fq_codel"
         warn "内核不支持 fq，已回退到 fq_codel。"
         return
+    fi
+
+    if [ -n "$QDISC_ORIGINAL" ]; then
+        sysctl -w "net.core.default_qdisc=$QDISC_ORIGINAL" >/dev/null 2>&1 || true
     fi
 
     warn "无法修改默认 qdisc；可能受容器权限或内核限制。"
@@ -403,13 +461,13 @@ select_profile() {
 
 next_buffer_tier() {
     requested="$1"
-    for tier in 4 8 16 32 64 128 256 512; do
+    for tier in 4 8 16 32 64 128 256; do
         if [ "$requested" -le "$tier" ]; then
             printf "%s" "$tier"
             return
         fi
     done
-    printf "512"
+    printf "256"
 }
 
 calculate_buffer() {
@@ -426,14 +484,19 @@ calculate_buffer() {
             printf "%d", mib;
         }')"
         BUFFER_MIB="$(next_buffer_tier "$REQUIRED_BUFFER_MIB")"
+        if [ "$BUFFER_MIB" -lt "$BASE_BUFFER_MIB" ]; then
+            BUFFER_MIB="$BASE_BUFFER_MIB"
+        fi
         BUFFER_SOURCE="bandwidth/RTT calculation"
     fi
 
     if [ -n "$BUFFER_OVERRIDE_MIB" ]; then
         BUFFER_MIB="$BUFFER_OVERRIDE_MIB"
         BUFFER_SOURCE="manual override"
-    elif [ "$BUFFER_MIB" -gt "$BUFFER_CAP_MIB" ]; then
-        warn "计算值 ${BUFFER_MIB} MiB 超过当前内存/配置档位的安全上限 ${BUFFER_CAP_MIB} MiB，已限制。"
+    fi
+
+    if [ "$BUFFER_MIB" -gt "$BUFFER_CAP_MIB" ]; then
+        warn "请求值 ${BUFFER_MIB} MiB 超过当前内存/配置档位的安全上限 ${BUFFER_CAP_MIB} MiB，已限制。"
         BUFFER_MIB="$BUFFER_CAP_MIB"
     fi
 
@@ -460,8 +523,8 @@ backup_one() {
     path="$1"
     rel="${path#/}"
     if [ -e "$path" ]; then
-        mkdir -p "$RUN_BACKUP/$(dirname "$rel")"
-        cp -p "$path" "$RUN_BACKUP/$rel"
+        mkdir -p "$RUN_BACKUP/$(dirname "$rel")" || { error "无法创建备份目录。"; exit 1; }
+        cp -p "$path" "$RUN_BACKUP/$rel" || { error "无法备份：$path"; exit 1; }
         printf "%s|present\n" "$path" >> "$RUN_BACKUP/manifest"
     else
         printf "%s|absent\n" "$path" >> "$RUN_BACKUP/manifest"
@@ -482,7 +545,6 @@ snapshot_runtime_sysctls() {
         net.ipv4.tcp_keepalive_time \
         net.ipv4.tcp_keepalive_intvl \
         net.ipv4.tcp_keepalive_probes \
-        net.ipv4.tcp_fin_timeout \
         net.core.somaxconn \
         net.core.netdev_max_backlog \
         net.ipv4.tcp_max_syn_backlog \
@@ -499,10 +561,60 @@ snapshot_runtime_sysctls() {
     done
 }
 
+qdisc_root_line() {
+    tc qdisc show dev "$1" 2>/dev/null | awk '
+        $1 == "qdisc" {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "root") { print; exit }
+            }
+        }'
+}
+
+snapshot_runtime_qdiscs() {
+    output="$1"
+    : > "$output"
+    command -v tc >/dev/null 2>&1 || return 0
+
+    for iface_path in /sys/class/net/*; do
+        [ -e "$iface_path" ] || continue
+        iface="${iface_path##*/}"
+        qline="$(qdisc_root_line "$iface")"
+        printf "%s|%s\n" "$iface" "$qline" >> "$output"
+    done
+}
+
+snapshot_persistence_state() {
+    : > "$RUN_BACKUP/persistence-state"
+    if [ "$INIT_SYSTEM" = "openrc" ] && command -v rc-update >/dev/null 2>&1; then
+        for service in sysctl procps; do
+            if rc-update show boot 2>/dev/null | awk '{print $1}' | grep -qx "$service"; then
+                printf "%s|enabled\n" "$service" >> "$RUN_BACKUP/persistence-state"
+            else
+                printf "%s|disabled\n" "$service" >> "$RUN_BACKUP/persistence-state"
+            fi
+        done
+    fi
+}
+
+guard_active_qdiscs() {
+    before="$1"
+    after="${RUN_BACKUP:-$STATE_DIR}/qdisc-after.$$"
+    snapshot_runtime_qdiscs "$after"
+    if ! command -v cmp >/dev/null 2>&1; then
+        warn "cmp 不可用，无法核对调优前后的活动 root qdisc。"
+    elif ! cmp -s "$before" "$after"; then
+        warn "检测到调优期间活动 root qdisc 发生变化。本脚本未主动覆盖它，请用 --status 检查。"
+        cp "$after" "$RUN_BACKUP/qdisc-after" 2>/dev/null || true
+    else
+        info "qdisc guard：活动 root qdisc 未被覆盖。"
+    fi
+    rm -f "$after"
+}
+
 create_backup() {
     timestamp="$(date +%Y%m%d-%H%M%S)"
     RUN_BACKUP="$BACKUP_DIR/${timestamp}-$$"
-    mkdir -p "$RUN_BACKUP"
+    mkdir -p "$RUN_BACKUP" || { error "无法创建快照：$RUN_BACKUP"; exit 1; }
     : > "$RUN_BACKUP/manifest"
 
     backup_one "$CONFIG_FILE"
@@ -513,8 +625,17 @@ create_backup() {
     backup_one "$SYSTEMD_USER_LIMITS"
     backup_one "$PROFILE_FILE"
     snapshot_runtime_sysctls
+    snapshot_runtime_qdiscs "$RUN_BACKUP/runtime-qdisc"
+    snapshot_persistence_state
 
     printf "%s\n" "$SCRIPT_VERSION" > "$RUN_BACKUP/version"
+    {
+        echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "pid=$$"
+        echo "profile=$EFFECTIVE_PROFILE"
+        echo "buffer_mib=$BUFFER_MIB"
+        echo "buffer_source=$BUFFER_SOURCE"
+    } > "$RUN_BACKUP/metadata"
     info "已备份原配置和运行时参数：$RUN_BACKUP"
 }
 
@@ -524,9 +645,11 @@ remove_marked_block() {
     end="$3"
     [ -f "$file" ] || return 0
 
-    tmp="/tmp/vps-optimize.$$.tmp"
-    sed "/$begin/,/$end/d" "$file" > "$tmp" 2>/dev/null || return 1
-    cat "$tmp" > "$file"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vps-optimize.XXXXXX")" || return 1
+    if ! sed "/$begin/,/$end/d" "$file" > "$tmp" 2>/dev/null || ! cat "$tmp" > "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
 }
 
@@ -541,7 +664,10 @@ prepare_legacy_cleanup() {
 
 write_sysctl_config() {
     mkdir -p /etc/sysctl.d
-    tmp="/tmp/vps-optimize.sysctl.$$"
+    tmp="$(mktemp /etc/sysctl.d/.99-zz-vps-optimize.XXXXXX)" || {
+        error "无法创建临时 sysctl 配置。"
+        exit 1
+    }
     : > "$tmp"
 
     {
@@ -577,12 +703,11 @@ write_sysctl_config() {
 
     {
         echo
-        echo "# Keepalive and stale connection cleanup"
+        echo "# Keepalive probes (connection lifecycle timeouts remain kernel defaults)"
     } >> "$tmp"
     emit_sysctl "net.ipv4.tcp_keepalive_time" "600" "$tmp"
     emit_sysctl "net.ipv4.tcp_keepalive_intvl" "30" "$tmp"
     emit_sysctl "net.ipv4.tcp_keepalive_probes" "5" "$tmp"
-    emit_sysctl "net.ipv4.tcp_fin_timeout" "30" "$tmp"
 
     {
         echo
@@ -608,8 +733,8 @@ write_sysctl_config() {
     } >> "$tmp"
     emit_sysctl "fs.file-max" "$FILE_MAX" "$tmp"
 
-    mv "$tmp" "$CONFIG_FILE"
-    chmod 0644 "$CONFIG_FILE"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE" || { error "无法写入：$CONFIG_FILE"; rm -f "$tmp"; exit 1; }
     info "已写入：$CONFIG_FILE"
 }
 
@@ -757,9 +882,22 @@ show_status() {
     echo
     if [ -f "$CONFIG_FILE" ]; then
         echo "配置文件：$CONFIG_FILE"
-        grep '^# Profile:\|^# Buffer:' "$CONFIG_FILE" 2>/dev/null || true
+        grep -E '^# (Profile|Buffer|Input):' "$CONFIG_FILE" 2>/dev/null || true
     else
         echo "未发现本脚本配置文件。"
+    fi
+
+    echo
+    echo "活动 root qdisc（脚本默认不直接覆盖）："
+    if command -v tc >/dev/null 2>&1; then
+        for iface_path in /sys/class/net/*; do
+            [ -e "$iface_path" ] || continue
+            iface="${iface_path##*/}"
+            qline="$(qdisc_root_line "$iface")"
+            [ -n "$qline" ] && printf "  %s: %s\n" "$iface" "$qline"
+        done
+    else
+        echo "  tc 命令不可用。"
     fi
 
     echo
@@ -769,6 +907,86 @@ show_status() {
     else
         echo "ss 命令不可用。"
     fi
+
+    find_latest_backup
+    if [ -n "$LATEST_BACKUP" ]; then
+        echo
+        echo "可回滚快照：$LATEST_BACKUP"
+    fi
+}
+
+find_latest_backup() {
+    LATEST_BACKUP=""
+    for candidate in "$BACKUP_DIR"/*; do
+        [ -f "$candidate/manifest" ] || continue
+        [ ! -f "$candidate/restored-at" ] || continue
+        LATEST_BACKUP="$candidate"
+    done
+}
+
+verify_current() {
+    detect_os
+    detect_resources
+    VERIFY_FAILURES=0
+    VERIFY_WARNINGS=0
+
+    echo "================================================="
+    echo " VPS Network Optimizer - 验证"
+    echo "================================================="
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        error "未找到配置文件：$CONFIG_FILE"
+        return 1
+    fi
+
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        line="$(printf "%s" "$raw" | sed 's/#.*$//')"
+        case "$line" in
+            *"="*)
+                key="$(trim "$(printf "%s" "$line" | cut -d= -f1)")"
+                expected="$(trim "$(printf "%s" "$line" | sed 's/^[^=]*=//')")"
+                [ -n "$key" ] || continue
+                actual="$(sysctl -n "$key" 2>/dev/null || true)"
+                actual="$(trim "$actual")"
+                if [ "$actual" = "$expected" ]; then
+                    printf "  [OK]   %s = %s\n" "$key" "$actual"
+                else
+                    printf "  [FAIL] %s: 期望 '%s'，当前 '%s'\n" "$key" "$expected" "${actual:-<unavailable>}"
+                    VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+                fi
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    forbidden='net.ipv4.tcp_mem|vm.min_free_kbytes|net.ipv4.tcp_tw_reuse|net.ipv4.tcp_fin_timeout|net.ipv4.tcp_reordering|net.ipv4.tcp_notsent_lowat|net.core.netdev_budget|net.core.netdev_budget_usecs'
+    if grep -Eq "^[[:space:]]*($forbidden)[[:space:]]*=" "$CONFIG_FILE"; then
+        printf "  [FAIL] 配置文件含默认路径禁止参数\n"
+        VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+    else
+        printf "  [OK]   未覆盖 tcp_mem/内存阈值/连接生命周期/netdev budget\n"
+    fi
+
+    if command -v tc >/dev/null 2>&1; then
+        echo
+        echo "活动 root qdisc（仅观察）："
+        for iface_path in /sys/class/net/*; do
+            [ -e "$iface_path" ] || continue
+            iface="${iface_path##*/}"
+            qline="$(qdisc_root_line "$iface")"
+            [ -n "$qline" ] && printf "  %s: %s\n" "$iface" "$qline"
+        done
+    else
+        warn "tc 不可用，无法观察活动 qdisc。"
+        VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1))
+    fi
+
+    echo
+    if [ "$VERIFY_FAILURES" -eq 0 ]; then
+        info "验证通过；运行时参数与脚本配置一致（警告 $VERIFY_WARNINGS）。"
+        return 0
+    fi
+    error "验证失败：$VERIFY_FAILURES 项不一致（警告 $VERIFY_WARNINGS）。"
+    return 1
 }
 
 restore_latest() {
@@ -777,21 +995,29 @@ restore_latest() {
         exit 1
     fi
 
-    latest="$(ls -1dt "$BACKUP_DIR"/* 2>/dev/null | head -n 1 || true)"
-    if [ -z "$latest" ] || [ ! -f "$latest/manifest" ]; then
+    acquire_lock
+    find_latest_backup
+    latest="$LATEST_BACKUP"
+    if [ -z "$latest" ]; then
         error "没有找到可恢复的备份。"
         exit 1
     fi
 
     info "正在恢复：$latest"
+    RESTORE_FAILURES=0
     while IFS='|' read -r path state; do
         [ -n "$path" ] || continue
         rel="${path#/}"
         if [ "$state" = "present" ]; then
-            mkdir -p "$(dirname "$path")"
-            cp -p "$latest/$rel" "$path"
+            if ! mkdir -p "$(dirname "$path")" || ! cp -p "$latest/$rel" "$path"; then
+                warn "无法恢复文件：$path"
+                RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+            fi
         else
-            rm -f "$path"
+            if ! rm -f "$path"; then
+                warn "无法移除调优后新建的文件：$path"
+                RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+            fi
         fi
     done < "$latest/manifest"
 
@@ -806,7 +1032,10 @@ restore_latest() {
         if [ -f "$latest/runtime-sysctl" ]; then
             while IFS='|' read -r key value; do
                 [ -n "$key" ] || continue
-                sysctl -w "$key=$value" >/dev/null 2>&1 || true
+                if ! sysctl -w "$key=$value" >/dev/null 2>&1; then
+                    warn "无法恢复运行时参数：$key"
+                    RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+                fi
             done < "$latest/runtime-sysctl"
         fi
     fi
@@ -816,13 +1045,42 @@ restore_latest() {
         systemctl restart systemd-sysctl >/dev/null 2>&1 || true
     fi
 
-    info "恢复完成。已恢复配置文件；个别运行时参数可能需要重启后完全回到系统默认值。"
+    if [ -f "$latest/persistence-state" ] && command -v rc-update >/dev/null 2>&1; then
+        while IFS='|' read -r service state; do
+            [ -n "$service" ] || continue
+            if [ "$state" = "enabled" ]; then
+                if ! rc-update add "$service" boot >/dev/null 2>&1; then
+                    warn "无法恢复 OpenRC 启动状态：$service"
+                    RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+                fi
+            else
+                if ! rc-update del "$service" boot >/dev/null 2>&1; then
+                    warn "无法恢复 OpenRC 启动状态：$service"
+                    RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+                fi
+            fi
+        done < "$latest/persistence-state"
+    fi
+
+    if [ "$RESTORE_FAILURES" -eq 0 ]; then
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$latest/restored-at"
+    else
+        error "恢复未完整完成：$RESTORE_FAILURES 项失败；快照保留为可再次恢复状态。"
+        return 1
+    fi
+
+    info "恢复完成。已逐项写回运行时参数，包括调优前的默认 qdisc。"
+    info "qdisc guard：不盲目重建活动 root qdisc，避免破坏 CAKE/HTB/MQ 等自定义队列。"
 }
 
 main_apply() {
     if [ "$DRY_RUN" = "0" ] && [ "$(id -u)" != "0" ]; then
         error "请使用 root 用户运行，例如：sudo sh optimize.sh"
         exit 1
+    fi
+
+    if [ "$DRY_RUN" = "0" ]; then
+        acquire_lock
     fi
 
     detect_os
@@ -870,6 +1128,7 @@ main_apply() {
     apply_sysctl_file "$CONFIG_FILE"
     write_limits
     restart_persistence_service
+    guard_active_qdiscs "$RUN_BACKUP/runtime-qdisc"
 
     echo
     if [ "$BBR_AVAILABLE" = "1" ]; then
@@ -889,6 +1148,7 @@ main_apply() {
 
     info "优化完成。建议重启代理服务；无需强制重启 VPS。"
     echo "检查命令：sh $0 --status"
+    echo "验证命令：sh $0 --verify"
     echo "回滚命令：sh $0 --restore"
 }
 
@@ -896,6 +1156,7 @@ main() {
     parse_args "$@"
     case "$ACTION" in
         status) show_status ;;
+        verify) verify_current ;;
         restore) restore_latest ;;
         apply) main_apply ;;
     esac
