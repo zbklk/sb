@@ -1,6 +1,6 @@
 #!/bin/bash
 # DMIT 自建站专用版：使用用户自己的 HTTPS 域名作为 Reality SNI，
-# 并把未认证连接安全转发到本机已验证的 HTTPS 网站后端。
+# 优先复用本机 HTTPS 网站；在安全条件满足时可自动安装 Caddy 建站。
 set -eu
 set -o pipefail 2>/dev/null || true
 umask 077
@@ -332,11 +332,12 @@ format_connect_address() {
 
 probe_https_backend() {
   local backend="$1" port="$2" domain="$3"
+  local probe_timeout="${4:-10}"
   local connect_address output_file
   connect_address="$(format_connect_address "$backend" "$port")"
   output_file="$(mktemp)"
 
-  if timeout 10 openssl s_client \
+  if timeout "$probe_timeout" openssl s_client \
       -connect "$connect_address" \
       -servername "$domain" \
       -verify_hostname "$domain" \
@@ -349,6 +350,196 @@ probe_https_backend() {
 
   rm -f "$output_file"
   return 1
+}
+
+show_web_port_owners() {
+  ss -H -lntp 2>/dev/null |
+    awk '$4 ~ /:(80|443)$/ { print "  " $0 }' || true
+}
+
+open_web_firewall_ports() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    info "放行 UFW 的 80/443 TCP 端口..."
+    ufw allow 80/tcp >/dev/null
+    ufw allow 443/tcp >/dev/null
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    info "放行 firewalld 的 80/443 TCP 端口..."
+    firewall-cmd --permanent --add-service=http >/dev/null
+    firewall-cmd --permanent --add-service=https >/dev/null
+    firewall-cmd --reload >/dev/null
+  else
+    warn "未检测到启用中的 UFW/firewalld；请确认 DMIT 控制台防火墙已放行 TCP 80 和 443"
+  fi
+}
+
+install_caddy_debian() {
+  local temp_dir managed_marker="/etc/caddy/.singbox-reality-managed"
+
+  [ "$OS" = "debian" ] || {
+    err "自动安装 Caddy 目前仅支持 Debian/Ubuntu"
+    return 1
+  }
+
+  if command -v caddy >/dev/null 2>&1 || [ -e /etc/caddy/Caddyfile ]; then
+    if [ -f "$managed_marker" ] && grep -Fxq "$REALITY_SNI" "$managed_marker"; then
+      info "复用本脚本此前为 $REALITY_SNI 创建的 Caddy 站点"
+      return 0
+    fi
+    err "检测到已有 Caddy 或 Caddy 配置；为避免覆盖现有站点，自动建站已停止"
+    err "请手动把域名 $REALITY_SNI 配置到现有 Caddy，完成后重新运行脚本"
+    return 1
+  fi
+
+  if port_is_listening 80 || port_is_listening 443; then
+    err "TCP 80 或 443 已被其他服务占用，不能安全地自动安装 Caddy"
+    show_web_port_owners
+    err "请先处理现有 Web 服务，或手动给它添加域名 $REALITY_SNI"
+    return 1
+  fi
+
+  info "安装 Caddy 官方稳定版软件源和服务..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg debian-keyring debian-archive-keyring apt-transport-https
+
+  temp_dir="$(mktemp -d)"
+  if ! curl -1fsSL --proto '=https' --tlsv1.2 \
+      'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      -o "$temp_dir/caddy.gpg.key"; then
+    rm -rf -- "$temp_dir"
+    err "Caddy 软件源签名密钥下载失败"
+    return 1
+  fi
+  if ! gpg --batch --yes --dearmor \
+      --output "$temp_dir/caddy-stable-archive-keyring.gpg" \
+      "$temp_dir/caddy.gpg.key"; then
+    rm -rf -- "$temp_dir"
+    err "Caddy 软件源签名密钥解析失败"
+    return 1
+  fi
+  if ! curl -1fsSL --proto '=https' --tlsv1.2 \
+      'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+      -o "$temp_dir/caddy-stable.list"; then
+    rm -rf -- "$temp_dir"
+    err "Caddy 软件源配置下载失败"
+    return 1
+  fi
+
+  grep -Eq '^deb ' "$temp_dir/caddy-stable.list" || {
+    rm -rf -- "$temp_dir"
+    err "下载的 Caddy 软件源配置格式异常"
+    return 1
+  }
+
+  install -m 0644 "$temp_dir/caddy-stable-archive-keyring.gpg" \
+    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  install -m 0644 "$temp_dir/caddy-stable.list" \
+    /etc/apt/sources.list.d/caddy-stable.list
+  rm -rf -- "$temp_dir"
+
+  apt-get update -y
+  apt-get install -y caddy
+  command -v caddy >/dev/null 2>&1 || {
+    err "Caddy 安装失败"
+    return 1
+  }
+}
+
+deploy_caddy_reality_site() {
+  local domain="$1" site_dir temp_config config_backup attempt
+
+  [ "$REALITY_HANDSHAKE_PORT" = "443" ] || {
+    err "自动建站只支持标准 HTTPS 后端端口 443"
+    return 1
+  }
+
+  install_caddy_debian || return 1
+  open_web_firewall_ports
+
+  site_dir="/var/www/reality-decoy/$domain"
+  install -d -m 0755 "$site_dir"
+  cat > "$site_dir/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Welcome</title></head>
+<body><main><h1>Welcome</h1><p>This site is running normally.</p></main></body>
+</html>
+EOF
+  chmod 0644 "$site_dir/index.html"
+
+  temp_config="$(mktemp)"
+  cat > "$temp_config" <<EOF
+$domain {
+    root * $site_dir
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        -Server
+    }
+    file_server
+}
+EOF
+
+  caddy fmt --overwrite "$temp_config"
+  caddy validate --config "$temp_config" --adapter caddyfile || {
+    rm -f "$temp_config"
+    err "生成的 Caddy 配置校验失败"
+    return 1
+  }
+
+  install -d -m 0755 /etc/caddy
+  config_backup=""
+  if [ -f /etc/caddy/Caddyfile ]; then
+    config_backup="/etc/caddy/Caddyfile.pre-reality.$(date +%Y%m%d%H%M%S)"
+    cp -p /etc/caddy/Caddyfile "$config_backup"
+  fi
+  install -m 0644 "$temp_config" /etc/caddy/Caddyfile
+  rm -f "$temp_config"
+  printf '%s\n' "$domain" > /etc/caddy/.singbox-reality-managed
+  chmod 0644 /etc/caddy/.singbox-reality-managed
+
+  systemctl daemon-reload
+  systemctl enable caddy >/dev/null 2>&1 || true
+  if ! systemctl restart caddy; then
+    if [ -n "$config_backup" ] && [ -f "$config_backup" ]; then
+      cp -p "$config_backup" /etc/caddy/Caddyfile
+      systemctl restart caddy || true
+    fi
+    err "Caddy 启动失败；请检查: journalctl -u caddy -n 100 --no-pager"
+    return 1
+  fi
+
+  info "等待 Caddy 申请 HTTPS 证书..."
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if probe_https_backend 127.0.0.1 443 "$domain" 3; then
+      REALITY_HANDSHAKE_SERVER="127.0.0.1"
+      info "Caddy 建站及可信 HTTPS 证书验证通过"
+      return 0
+    fi
+    sleep 3
+  done
+
+  err "Caddy 在等待时间内未取得有效证书"
+  err "请确认公网 TCP 80/443 已放行，然后检查: journalctl -u caddy -n 100 --no-pager"
+  return 1
+}
+
+offer_caddy_auto_deploy() {
+  local choice
+
+  if [ "$OS" != "debian" ] || [ "$REALITY_HANDSHAKE_PORT" != "443" ]; then
+    return 1
+  fi
+
+  echo
+  warn "没有检测到可用的 HTTPS 网站"
+  echo "脚本可以自动安装 Caddy、创建最小伪装页，并为 $REALITY_SNI 申请可信证书。"
+  read -r -p "是否自动建站？[Y/n]: " choice
+  case "${choice,,}" in
+    ""|y|yes) deploy_caddy_reality_site "$REALITY_SNI" ;;
+    *) return 1 ;;
+  esac
 }
 
 find_local_https_backend() {
@@ -401,7 +592,10 @@ configure_reality_site() {
   done
 
   validate_reality_domain_dns "$REALITY_SNI" || return 1
-  find_local_https_backend "$REALITY_SNI" "$REALITY_HANDSHAKE_PORT" || return 1
+  if ! find_local_https_backend "$REALITY_SNI" "$REALITY_HANDSHAKE_PORT"; then
+    offer_caddy_auto_deploy || return 1
+    find_local_https_backend "$REALITY_SNI" "$REALITY_HANDSHAKE_PORT" || return 1
+  fi
 
   echo
   info "Reality 伪装站点配置:"
@@ -699,7 +893,6 @@ build_config() {
   local first_inbound=true
   local NOTE SS_PORT SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD REALITY_UUID
   local first_user
-  local comma
 
   if [ "$ENABLE_SS" = true ]; then
     while IFS=',' read -r NOTE SS_PORT SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD REALITY_UUID; do
