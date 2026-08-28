@@ -8,8 +8,6 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-[ "$(id -u)" = "0" ] || { err "请以 root 运行"; exit 1; }
-
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 CACHE_FILE="$CONFIG_DIR/.config_cache"
@@ -83,16 +81,16 @@ install_deps() {
   case "$OS" in
     alpine)
       apk update
-      apk add --no-cache bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-tools
+      apk add --no-cache bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-tools iproute2
       ;;
     debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk dnsutils
+      apt-get install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk dnsutils iproute2
       ;;
     redhat)
-      yum install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-utils || \
-      dnf install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-utils
+      yum install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-utils iproute || \
+      dnf install -y bash curl ca-certificates openssl jq qrencode coreutils grep sed gawk bind-utils iproute
       ;;
     *)
       warn "未识别系统，请确保已安装: bash curl openssl jq qrencode"
@@ -158,19 +156,34 @@ get_public_ip() {
 
 # ---------- DMIT Reality SNI 优选 ----------
 SNI_TOP_N="${SNI_TOP_N:-5}"
-SNI_SAMPLES="${SNI_SAMPLES:-2}"
+SNI_SAMPLES=3
 SNI_CONNECT_TIMEOUT="${SNI_CONNECT_TIMEOUT:-4}"
 SNI_TOTAL_TIMEOUT="${SNI_TOTAL_TIMEOUT:-8}"
 
-DMIT_LOCAL_IP=""
+DMIT_LOCAL_IPV4=""
+DMIT_LOCAL_IPV6=""
 DMIT_LOCAL_ASN="?"
 DMIT_LOCAL_ASN_NAME="UNKNOWN"
+DMIT_LOCAL_ASNS=""
+declare -a DMIT_LOCAL_IPS=()
 
 get_public_ipv4() {
-  local ip=""
-  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+  local ip="" url
+  for url in https://api4.ipify.org https://v4.ident.me https://icanhazip.com; do
     ip="$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_public_ipv6() {
+  local ip="" url
+  for url in https://api6.ipify.org https://v6.ident.me https://icanhazip.com; do
+    ip="$(curl -6 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
       printf '%s' "$ip"
       return 0
     fi
@@ -185,9 +198,15 @@ reverse_ipv4() {
 }
 
 get_ip_asn() {
-  local ip="$1" result asn
-  result="$(dig +short TXT "$(reverse_ipv4 "$ip").origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
-  asn="$(printf '%s' "$result" | awk -F'|' '{gsub(/[[:space:]]/,"",$1); print $1}')"
+  local ip="$1" result asn org
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    result="$(dig +short TXT "$(reverse_ipv4 "$ip").origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
+    asn="$(printf '%s' "$result" | awk -F'|' '{gsub(/[[:space:]]/,"",$1); print $1}')"
+  fi
+  if ! [[ "${asn:-}" =~ ^[0-9]+$ ]]; then
+    org="$(curl -fsS --max-time 5 "https://ipinfo.io/${ip}/json" 2>/dev/null | jq -r '.org // empty' 2>/dev/null || true)"
+    asn="$(printf '%s' "$org" | sed -nE 's/^AS([0-9]+).*/\1/p')"
+  fi
   [[ "$asn" =~ ^[0-9]+$ ]] && printf '%s' "$asn" || printf '?'
 }
 
@@ -197,6 +216,12 @@ get_asn_name() {
   result="$(dig +short TXT "AS${asn}.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
   name="$(printf '%s' "$result" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $5); print $5}')"
   [ -n "$name" ] && printf '%s' "$name" || printf 'UNKNOWN'
+}
+
+get_ip_org() {
+  local ip="$1" org
+  org="$(curl -fsS --max-time 5 "https://ipinfo.io/${ip}/json" 2>/dev/null | jq -r '.org // empty' 2>/dev/null || true)"
+  printf '%s' "$org" | sed -E 's/^AS[0-9]+[[:space:]]*//'
 }
 
 sanitize_sni() {
@@ -209,7 +234,7 @@ valid_sni() {
 
 is_shared_asn() {
   case "$1" in
-    13335|54113|20940|16625|32787|16509|14618|15169|396982|8075) return 0 ;;
+    8075|12222|12989|13335|14061|14618|15133|15169|16276|16509|16625|19551|20473|20940|21342|24940|28753|31898|32787|33905|37963|396982|45090|45102|54113|60068|60781|63949|132203|199524|209242|212238) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -218,34 +243,125 @@ has_shared_network_marker() {
   local text
   text="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   printf '%s' "$text" | grep -Eqi \
-    'cloudflare|fastly|akamai|cloudfront|amazon|amazonaws|google|microsoft|azure|vercel|netlify|edgecast|imperva|incapsula|stackpath|bunnycdn|bunny\.net|gcore|cdn77|cdnetworks|alibaba|aliyun|tencent cloud|leaseweb cdn'
+    'cloudflare|fastly|akamai|cloudfront|amazon|amazonaws|google cloud|googleusercontent|microsoft|azure|vercel|netlify|edgecast|imperva|incapsula|stackpath|bunnycdn|bunny\.net|gcore|cdn77|cdnetworks|alibaba|aliyun|tencent cloud|oracle cloud|digitalocean|hetzner|linode|akamai connected cloud|ovh|vultr|leaseweb cdn'
+}
+
+append_unique_word() {
+  local list="$1" value="$2"
+  [ -n "$value" ] || { printf '%s' "$list"; return 0; }
+  case " $list " in
+    *" $value "*) printf '%s' "$list" ;;
+    *) printf '%s%s%s' "$list" "${list:+ }" "$value" ;;
+  esac
+}
+
+is_local_ip() {
+  local candidate="$1" local_ip
+  for local_ip in "${DMIT_LOCAL_IPS[@]}"; do
+    [ "$candidate" != "$local_ip" ] || return 0
+  done
+  return 1
+}
+
+is_local_asn() {
+  [ "$1" != "?" ] || return 1
+  case " $DMIT_LOCAL_ASNS " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+collect_interface_ips() {
+  local ip
+  command -v ip >/dev/null 2>&1 || return 0
+  while read -r ip; do
+    [ -n "$ip" ] && ! is_local_ip "$ip" && DMIT_LOCAL_IPS+=("$ip")
+  done < <(ip -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4}')
+}
+
+show_local_ip_metadata() {
+  local family="$1" ip="$2" asn name asn_label
+  if [ -z "$ip" ]; then
+    printf '  %-4s %s\n' "$family:" "不可用或未检测到"
+    return 0
+  fi
+
+  asn="$(get_ip_asn "$ip")"
+  name="$(get_asn_name "$asn")"
+  if [ "$name" = "UNKNOWN" ]; then
+    name="$(get_ip_org "$ip")"
+    [ -n "$name" ] || name="UNKNOWN"
+  fi
+  asn_label="ASN 查询失败"
+  [ "$asn" = "?" ] || asn_label="AS${asn}"
+  printf '  %-5s %s / %s / %s\n' "$family:" "$ip" "$asn_label" "$name"
+  if [ "$asn" != "?" ]; then
+    DMIT_LOCAL_ASNS="$(append_unique_word "$DMIT_LOCAL_ASNS" "$asn")"
+    if [ "$DMIT_LOCAL_ASN" = "?" ]; then
+      DMIT_LOCAL_ASN="$asn"
+      DMIT_LOCAL_ASN_NAME="$name"
+    fi
+  fi
 }
 
 detect_dmit_network() {
-  DMIT_LOCAL_IP="$(get_public_ipv4 || true)"
-  [ -n "$DMIT_LOCAL_IP" ] || { err "无法获取 DMIT VPS 的公网 IPv4，不能安全执行 Reality SNI 优选"; return 1; }
+  DMIT_LOCAL_IPV4="$(get_public_ipv4 || true)"
+  DMIT_LOCAL_IPV6="$(get_public_ipv6 || true)"
+  DMIT_LOCAL_ASN="?"
+  DMIT_LOCAL_ASN_NAME="UNKNOWN"
+  DMIT_LOCAL_ASNS=""
+  DMIT_LOCAL_IPS=()
+  [ -n "$DMIT_LOCAL_IPV4" ] && DMIT_LOCAL_IPS+=("$DMIT_LOCAL_IPV4")
+  [ -n "$DMIT_LOCAL_IPV6" ] && DMIT_LOCAL_IPS+=("$DMIT_LOCAL_IPV6")
+  collect_interface_ips
 
-  DMIT_LOCAL_ASN="$(get_ip_asn "$DMIT_LOCAL_IP")"
-  DMIT_LOCAL_ASN_NAME="$(get_asn_name "$DMIT_LOCAL_ASN")"
-  [ "$DMIT_LOCAL_ASN" != "?" ] || { err "无法确认 VPS ASN，严格模式下停止 Reality SNI 优选"; return 1; }
+  echo
+  info "当前 VPS 公网网络信息:"
+  show_local_ip_metadata "IPv4" "$DMIT_LOCAL_IPV4"
+  show_local_ip_metadata "IPv6" "$DMIT_LOCAL_IPV6"
 
-  info "当前 VPS: $DMIT_LOCAL_IP / AS$DMIT_LOCAL_ASN / $DMIT_LOCAL_ASN_NAME"
-  if ! printf '%s' "$DMIT_LOCAL_ASN_NAME" | grep -Eqi 'DMIT|DMITCLOUD|DMIT-CLOUD'; then
-    warn "当前 ASN 名称未识别为 DMIT；仍按实际 ASN 严格检测，但建议只在 DMIT VPS 使用本脚本"
+  if [ -z "$DMIT_LOCAL_IPV4" ] && [ -z "$DMIT_LOCAL_IPV6" ]; then
+    warn "公网 IP 检测失败；将使用本机接口地址排除回环目标，安装继续"
   fi
+  if [ -z "$DMIT_LOCAL_ASNS" ]; then
+    warn "ASN/组织查询失败：同 ASN 加分自动停用，安全检测和安装不会中断"
+  elif ! printf '%s' "$DMIT_LOCAL_ASN_NAME" | grep -Eqi 'DMIT|DMITCLOUD|DMIT-CLOUD'; then
+    warn "当前 ASN 名称未识别为 DMIT；仍按实际 ASN 检测，但建议只在 DMIT VPS 使用本脚本"
+  fi
+  return 0
+}
+
+median_and_jitter_ms() {
+  LC_ALL=C sort -n | awk '
+    { values[NR]=$1; sum+=$1 }
+    END {
+      if (NR == 0) exit 1
+      if (NR % 2) median=values[(NR+1)/2]
+      else median=(values[NR/2]+values[NR/2+1])/2
+      printf "%.1f|%.1f", median*1000, (values[NR]-values[1])*1000
+    }'
 }
 
 evaluate_reality_domain() {
   local domain="$1" cname_text ip asn asn_name tls_output curl_output rc
-  local total=0 ok=0 sample sec http_code="000" avg_ms latency_score score same_asn h2
-  local -a ips
+  local sample sec http_code verify_result metrics failures failure_rate
+  local stability_score jitter_score latency_score score same_asn h2 tls13 cert_match
+  local -a ips all_dns_ips samples
+  local -A candidate_asns candidate_asn_names
 
   SNI_TEST_REASON=""
   SNI_TEST_DOMAIN="$(sanitize_sni "$domain")"
   valid_sni "$SNI_TEST_DOMAIN" || { SNI_TEST_REASON="域名格式无效"; return 1; }
 
   mapfile -t ips < <(dig +short A "$SNI_TEST_DOMAIN" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
+  mapfile -t all_dns_ips < <({ printf '%s\n' "${ips[@]}"; dig +short AAAA "$SNI_TEST_DOMAIN" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$'; } | sed '/^$/d' | sort -u)
   [ "${#ips[@]}" -gt 0 ] || { SNI_TEST_REASON="DNS A 记录失败"; return 1; }
+  for ip in "${all_dns_ips[@]}"; do
+    if is_local_ip "$ip"; then
+      SNI_TEST_REASON="域名解析到本机 IP（$ip），已阻止回环"
+      return 1
+    fi
+  done
 
   cname_text="$(dig +short CNAME "$SNI_TEST_DOMAIN" 2>/dev/null | tr '\n' ' ' || true)"
   if has_shared_network_marker "$SNI_TEST_DOMAIN $cname_text"; then
@@ -253,81 +369,104 @@ evaluate_reality_domain() {
     return 1
   fi
 
+  for ip in "${ips[@]}"; do
+    asn="$(get_ip_asn "$ip")"
+    asn_name="$(get_asn_name "$asn")"
+    candidate_asns["$ip"]="$asn"
+    candidate_asn_names["$ip"]="$asn_name"
+    if { [ "$asn" != "?" ] && is_shared_asn "$asn"; } || has_shared_network_marker "$asn_name"; then
+      SNI_TEST_REASON="解析 IP $ip 命中共享 CDN/云网络（AS${asn} ${asn_name}）"
+      return 1
+    fi
+  done
+
   SNI_TEST_IP=""
   SNI_TEST_ASN="?"
   SNI_TEST_ASN_NAME="UNKNOWN"
   SNI_TEST_TLS_MS=""
+  SNI_TEST_JITTER_MS=""
+  SNI_TEST_FAILURE_RATE="100.0"
   SNI_TEST_HTTP="000"
   SNI_TEST_H2="NO"
+  SNI_TEST_TLS13="NO"
+  SNI_TEST_CERT_MATCH="NO"
   SNI_TEST_SAME_ASN="NO"
   SNI_TEST_SCORE=0
 
   for ip in "${ips[@]:0:3}"; do
-    [ "$ip" != "$DMIT_LOCAL_IP" ] || continue
-
-    asn="$(get_ip_asn "$ip")"
-    [ "$asn" != "?" ] || continue
-    asn_name="$(get_asn_name "$asn")"
-    if is_shared_asn "$asn" || has_shared_network_marker "$asn_name"; then
-      continue
-    fi
+    asn="${candidate_asns[$ip]}"
+    asn_name="${candidate_asn_names[$ip]}"
 
     tls_output="$(timeout "${SNI_TOTAL_TIMEOUT}s" openssl s_client \
-      -connect "${ip}:443" -servername "$SNI_TEST_DOMAIN" -tls1_3 \
+      -connect "${ip}:443" -servername "$SNI_TEST_DOMAIN" \
       -alpn 'h2,http/1.1' </dev/null 2>/dev/null || true)"
-    printf '%s' "$tls_output" | grep -Eqi 'TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' || continue
+    printf '%s' "$tls_output" | grep -Eqi 'TLSv1\.[23]|Protocol *: *TLSv1\.[23]' || continue
 
     h2="NO"
+    tls13="NO"
     printf '%s' "$tls_output" | grep -qi 'ALPN protocol: h2' && h2="YES"
+    printf '%s' "$tls_output" | grep -Eqi 'TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' && tls13="YES"
 
-    total=0
-    ok=0
+    samples=()
     http_code="000"
+    cert_match="NO"
     for ((sample=1; sample<=SNI_SAMPLES; sample++)); do
       rc=0
       curl_output="$(curl -4 -sS -o /dev/null \
         --resolve "${SNI_TEST_DOMAIN}:443:${ip}" \
         --connect-timeout "$SNI_CONNECT_TIMEOUT" --max-time "$SNI_TOTAL_TIMEOUT" \
-        -w '%{time_appconnect}|%{http_code}' "https://${SNI_TEST_DOMAIN}/" 2>/dev/null)" || rc=$?
+        -w '%{time_appconnect}|%{http_code}|%{ssl_verify_result}' "https://${SNI_TEST_DOMAIN}/" 2>/dev/null)" || rc=$?
       [ "$rc" -eq 0 ] || continue
-      sec="${curl_output%%|*}"
-      http_code="${curl_output##*|}"
+      IFS='|' read -r sec http_code verify_result <<< "$curl_output"
+      [ "$verify_result" = "0" ] || continue
       if awk -v value="$sec" 'BEGIN {exit !(value > 0)}'; then
-        total="$(awk -v a="$total" -v b="$sec" 'BEGIN {printf "%.6f", a+b}')"
-        ok=$((ok + 1))
+        samples+=("$sec")
+        cert_match="YES"
       fi
     done
-    [ "$ok" -gt 0 ] || continue
 
-    avg_ms="$(awk -v value="$total" -v count="$ok" 'BEGIN {printf "%.1f", (value/count)*1000}')"
-    if [ -z "$SNI_TEST_IP" ] || awk -v a="$avg_ms" -v b="$SNI_TEST_TLS_MS" 'BEGIN {exit !(a < b)}'; then
+    [ "${#samples[@]}" -ge 2 ] || continue
+    metrics="$(printf '%s\n' "${samples[@]}" | median_and_jitter_ms)" || continue
+    failures=$((SNI_SAMPLES - ${#samples[@]}))
+    failure_rate="$(awk -v failed="$failures" -v count="$SNI_SAMPLES" 'BEGIN {printf "%.1f", failed*100/count}')"
+
+    if [ -z "$SNI_TEST_IP" ] || awk -v af="$failure_rate" -v bf="$SNI_TEST_FAILURE_RATE" -v am="${metrics%%|*}" -v bm="$SNI_TEST_TLS_MS" 'BEGIN {exit !((af < bf) || (af == bf && am < bm))}'; then
       SNI_TEST_IP="$ip"
       SNI_TEST_ASN="$asn"
       SNI_TEST_ASN_NAME="$asn_name"
-      SNI_TEST_TLS_MS="$avg_ms"
+      SNI_TEST_TLS_MS="${metrics%%|*}"
+      SNI_TEST_JITTER_MS="${metrics##*|}"
+      SNI_TEST_FAILURE_RATE="$failure_rate"
       SNI_TEST_HTTP="$http_code"
       SNI_TEST_H2="$h2"
+      SNI_TEST_TLS13="$tls13"
+      SNI_TEST_CERT_MATCH="$cert_match"
     fi
   done
 
   [ -n "$SNI_TEST_IP" ] || {
-    SNI_TEST_REASON="443/TLS 1.3/证书校验失败，或目标属于共享 CDN/云网络"
+    SNI_TEST_REASON="443/TLS/证书校验失败、3 次握手成功不足 2 次，或目标属于共享 CDN/云网络"
     return 1
   }
 
   same_asn="NO"
-  [ "$SNI_TEST_ASN" = "$DMIT_LOCAL_ASN" ] && same_asn="YES"
+  is_local_asn "$SNI_TEST_ASN" && same_asn="YES"
   SNI_TEST_SAME_ASN="$same_asn"
 
-  latency_score="$(awk -v ms="$SNI_TEST_TLS_MS" 'BEGIN {
-    if (ms <= 10) print 30; else if (ms <= 20) print 27; else if (ms <= 40) print 23;
-    else if (ms <= 60) print 19; else if (ms <= 100) print 14; else if (ms <= 150) print 8;
-    else if (ms <= 250) print 3; else print 0
+  if awk -v rate="$SNI_TEST_FAILURE_RATE" 'BEGIN {exit !(rate == 0)}'; then stability_score=400; else stability_score=200; fi
+  jitter_score="$(awk -v ms="$SNI_TEST_JITTER_MS" 'BEGIN {
+    if (ms <= 5) print 40; else if (ms <= 15) print 30; else if (ms <= 30) print 20;
+    else if (ms <= 60) print 10; else print 0
   }')"
-  score=$((50 + latency_score))
-  [ "$same_asn" = "YES" ] && score=$((score + 40))
-  [ "$SNI_TEST_H2" = "YES" ] && score=$((score + 5))
-  [[ "$SNI_TEST_HTTP" =~ ^[234][0-9][0-9]$ ]] && score=$((score + 3))
+  latency_score="$(awk -v ms="$SNI_TEST_TLS_MS" 'BEGIN {
+    if (ms <= 10) print 80; else if (ms <= 20) print 70; else if (ms <= 40) print 60;
+    else if (ms <= 60) print 50; else if (ms <= 100) print 40; else if (ms <= 150) print 25;
+    else if (ms <= 250) print 10; else print 0
+  }')"
+  score=$((1000 + stability_score + jitter_score + latency_score + 5))
+  [ "$same_asn" = "YES" ] && score=$((score + 100))
+  [ "$SNI_TEST_TLS13" = "YES" ] && score=$((score + 10))
+  [ "$SNI_TEST_H2" = "YES" ] && score=$((score + 2))
   SNI_TEST_SCORE="$score"
   return 0
 }
@@ -344,19 +483,21 @@ select_reality_sni() {
     www.python.org www.apache.org
   )
 
-  detect_dmit_network || return 1
+  detect_dmit_network
   result_file="$(mktemp)"
   : > "$result_file"
 
   echo
-  info "开始严格检测 ${#default_domains[@]} 个 Reality SNI 候选（DNS/443/TLS 1.3/证书/H2/ASN/延迟）..."
+  info "开始检测 ${#default_domains[@]} 个候选；每个候选连续进行 3 次 TLS 握手..."
+  info "评分顺序：安全/非 CDN > TLS 稳定性 > 同 ASN > TLS 延迟 > TLS1.3/证书 > H2"
   for domain in "${default_domains[@]}"; do
     printf '  %-28s ' "$domain"
     if evaluate_reality_domain "$domain"; then
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$SNI_TEST_SCORE" "$SNI_TEST_TLS_MS" "$SNI_TEST_DOMAIN" "$SNI_TEST_IP" \
-        "$SNI_TEST_ASN" "$SNI_TEST_SAME_ASN" "$SNI_TEST_H2" "$SNI_TEST_ASN_NAME" >> "$result_file"
-      echo "通过  ${SNI_TEST_TLS_MS} ms  AS${SNI_TEST_ASN}"
+        "$SNI_TEST_ASN" "$SNI_TEST_SAME_ASN" "$SNI_TEST_H2" "$SNI_TEST_ASN_NAME" \
+        "$SNI_TEST_JITTER_MS" "$SNI_TEST_FAILURE_RATE" "$SNI_TEST_TLS13" "$SNI_TEST_CERT_MATCH" >> "$result_file"
+      echo "通过  中位 ${SNI_TEST_TLS_MS} ms  抖动 ${SNI_TEST_JITTER_MS} ms  失败 ${SNI_TEST_FAILURE_RATE}%  AS${SNI_TEST_ASN}"
     else
       echo "排除  $SNI_TEST_REASON"
     fi
@@ -367,17 +508,18 @@ select_reality_sni() {
 
   echo
   if [ "${#top_rows[@]}" -gt 0 ]; then
-    echo "Reality SNI Top ${#top_rows[@]}（已严格排除共享 CDN/云网络）:"
-    printf '  %-3s %-28s %-7s %-9s %-9s %-5s %s\n' "序号" "域名" "评分" "TLS(ms)" "ASN" "同ASN" "H2"
+    echo "Reality SNI Top ${#top_rows[@]}（共享 CDN/云网络及本机 IP 已排除）:"
+    printf '  %-3s %-25s %-5s %-8s %-8s %-7s %-9s %-5s %-6s %-5s %s\n' \
+      "序号" "域名" "评分" "中位ms" "抖动ms" "失败率" "ASN" "同ASN" "TLS1.3" "证书" "H2"
     i=1
     for line in "${top_rows[@]}"; do
-      IFS=$'\t' read -r _ _ domain _ SNI_TEST_ASN SNI_TEST_SAME_ASN SNI_TEST_H2 _ <<< "$line"
-      printf '  %-3s %-28s %-7s %-9s AS%-7s %-5s %s\n' \
-        "$i" "$domain" "${line%%$'\t'*}" "$(printf '%s' "$line" | cut -f2)" \
-        "$SNI_TEST_ASN" "$SNI_TEST_SAME_ASN" "$SNI_TEST_H2"
+      IFS=$'\t' read -r score SNI_TEST_TLS_MS domain _ SNI_TEST_ASN SNI_TEST_SAME_ASN SNI_TEST_H2 _ SNI_TEST_JITTER_MS SNI_TEST_FAILURE_RATE SNI_TEST_TLS13 SNI_TEST_CERT_MATCH <<< "$line"
+      printf '  %-3s %-25s %-5s %-8s %-8s %-7s %-9s %-5s %-6s %-5s %s\n' \
+        "$i" "$domain" "$score" "$SNI_TEST_TLS_MS" "$SNI_TEST_JITTER_MS" "${SNI_TEST_FAILURE_RATE}%" \
+        "AS${SNI_TEST_ASN}" "$SNI_TEST_SAME_ASN" "$SNI_TEST_TLS13" "$SNI_TEST_CERT_MATCH" "$SNI_TEST_H2"
       i=$((i + 1))
     done
-    echo "  m)  手动输入自定义 SNI（仍执行同样的严格校验）"
+    echo "  m)  手动输入自定义 SNI（执行完全相同的严格校验）"
   else
     warn "默认候选池没有找到安全候选；不会偷偷使用任何公共默认 SNI"
     echo "只能手动输入一个自定义 SNI 并通过严格校验，或输入 q 终止安装。"
@@ -402,7 +544,7 @@ select_reality_sni() {
         printf '  正在严格校验 %s ... ' "$(sanitize_sni "$domain")"
         if evaluate_reality_domain "$domain"; then
           REALITY_SNI="$SNI_TEST_DOMAIN"
-          echo "通过  ${SNI_TEST_TLS_MS} ms  AS${SNI_TEST_ASN}"
+          echo "通过  中位 ${SNI_TEST_TLS_MS} ms  抖动 ${SNI_TEST_JITTER_MS} ms  失败 ${SNI_TEST_FAILURE_RATE}%  AS${SNI_TEST_ASN}"
           break
         fi
         echo "未通过：$SNI_TEST_REASON"
@@ -906,6 +1048,7 @@ EOSB
 }
 
 main() {
+  [ "$(id -u)" = "0" ] || { err "请以 root 运行"; exit 1; }
   info "DMIT 专用 sing-box 安装脚本"
   install_deps
   install_singbox
@@ -938,4 +1081,6 @@ main() {
   cat "$URI_FILE"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
