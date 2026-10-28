@@ -189,7 +189,7 @@ do_install() (
   curl -4fsS --noproxy '*' --interface "$IPV4" --connect-timeout 5 --max-time 15 https://api.ipify.org >/dev/null
   local stage created=0 password self_signed=1
   stage=$(mktemp -d /tmp/anytls-v6v4-install.XXXXXXXX)
-  # shellcheck disable=SC2329 # Invoked by the EXIT trap.
+  # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap.
   cleanup() {
     local rc=$?
     rm -rf -- "$stage"
@@ -241,7 +241,7 @@ self_test() (
   installed || die '尚未安装 AnyTLS'
   local tmp pid='' port expected observed direct n
   tmp=$(mktemp -d /tmp/anytls-v6v4-test.XXXXXXXX)
-  # shellcheck disable=SC2329 # Invoked by the EXIT trap.
+  # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap.
   cleanup_test() {
     [[ -z "$pid" ]] || { kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; }
     rm -rf -- "$tmp"
@@ -316,7 +316,7 @@ main() {
   while (( $# )); do
     case "$1" in
       --port|--ipv6|--ipv4|--server-name|--cert|--key)
-        (( $# >= 2 )) && [[ -n "$2" ]] || die "参数 $1 缺少值"
+        if (( $# < 2 )) || [[ -z "$2" ]]; then die "参数 $1 缺少值"; fi
         case "$1" in
           --port) PORT=$2 ;; --ipv6) IPV6=$2 ;; --ipv4) IPV4=$2 ;;
           --server-name) SERVER_NAME=$2 ;; --cert) CERT=$2 ;; --key) KEY=$2 ;;
