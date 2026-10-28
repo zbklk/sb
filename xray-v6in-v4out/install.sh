@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.0.3
+SCRIPT_VERSION=2.1.0
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -30,7 +30,7 @@ need_root() { (( EUID == 0 )) || die '请先 sudo -i 切换 root。'; }
 help_msg() {
   cat <<'EOF'
 Xray IPv6 入站 / IPv4 出站 V2 交互管理脚本
-用法：bash install.sh [menu|install|show|qr|status|port|sni|rotate|restart|backup|restore|uninstall] [选项]
+用法：bash install.sh [menu|install|show|qr|status|port|sni|rotate|restart|backup|restore|uninstall|diagnose|selftest|dns|log] [选项]
 无参数且为交互终端：显示中文菜单；无交互终端：按默认参数安装（已安装则保持不变）。
   --ipv6 地址     安装时绑定的本机公网 IPv6（默认自动检测）
   --ipv4 地址     本机出站 IPv4（NAT VPS 填内网 IPv4；默认从路由检测）
@@ -204,7 +204,7 @@ PY
 write_config() {
   # $1 output, following parameters are IPv6, IPv4, port, UUID, private, short, SNI.
   python3 - "$@" <<'PY'
-import json,sys
+import json,sys,os
 out,v6,v4,port,uid,private,short,sni=sys.argv[1:]
 obj={
   'log':{'loglevel':'warning'},
@@ -223,6 +223,13 @@ obj={
   'routing':{'domainStrategy':'AsIs','rules':[
     {'type':'field','inboundTag':['v6-reality-in'],'outboundTag':'ipv4-direct'}]}
 }
+# Preserve runtime DNS/log settings when changing SNI, port or credentials.
+# Existing config is user-controlled and no external path is accepted.
+if os.path.isfile('/etc/xray-v6v4/config.json'):
+    with open('/etc/xray-v6v4/config.json',encoding='utf-8') as prev_file:
+        prev=json.load(prev_file)
+    for field in ('dns','log'):
+        if field in prev: obj[field]=prev[field]
 with open(out,'w',encoding='utf-8') as f: json.dump(obj,f,indent=2,ensure_ascii=False);f.write('\n')
 PY
 }
@@ -358,6 +365,7 @@ do_install() {
   info "IPv6 入站：[$IPV6]:$PORT"
   info "IPv4 出站：$IPV4 → 公网 $observed"
   ensure_xray
+  reality_probe "$SNI" || warn 'REALITY 目标检测失败，安装后必须进行完整代理自检'
   keys
   create_user
   mkdir -p "$DIR" || die '无法创建节点配置目录。'
@@ -382,7 +390,9 @@ do_install() {
   fi
   rm -rf -- "$stage"
   trap - EXIT
-  info '部署成功！下面自动展示节点链接和二维码。'
+  info '服务已启动，现在进行完整代理端到端自检...'
+  if self_test; then info '本机端到端检测通过；请另外检查外部 IPv6 可达性'; else warn '节点已启动但代理端到端检测失败，请使用菜单 10 诊断'; fi
+  info '下面显示节点链接和二维码（请勿公开分享）'
   show_info
   firewall_hint "$PORT" "$IPV6"
 }
@@ -432,7 +442,7 @@ change_sni() {
   [[ -n "$new" ]] || prompt new "新 SNI（当前 ${C[6]}）：" "${C[6]}" || die '无法读取输入。'
   valid_sni "$new" || die 'SNI 不是有效域名。'
   if [[ "$new" == "${C[6]}" ]]; then info 'SNI 未变化。'; return 0; fi
-  warn '新 SNI 必须可从 VPS 访问且支持 TLS 1.3；可用 xray tls ping 域名 检查。'
+  reality_probe "$new" || warn '目标预检查未通过，仍允许修改，但建议执行完整代理自检'
   public=$(client_public)
   tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX")
   write_config "$tmp" "${C[0]}" "${C[1]}" "${C[2]}" "${C[3]}" "${C[4]}" "${C[5]}" "$new"
@@ -554,10 +564,181 @@ interactive_install() {
   prompt proposed "监听 TCP 端口 [$PORT]：" "$PORT" || die '无法读取端口。'; PORT=$proposed
   prompt proposed "REALITY SNI [$SNI]：" "$SNI" || die '无法读取 SNI。'; SNI=$proposed
   info '公网 IPv6 和本机 IPv4 默认为自动检测，留空表示自动。'
-  prompt proposed '指定公网 IPv6（回车自动检测）：' "$IPV6" || die '无法读取 IPv6。'; IPV6=$proposed
+  prompt proposed '指定公网 IPv6（回车自动选择）：' "$IPV6" || die '无法读取 IPv6。'; IPV6=$proposed
+  [[ -n "$IPV6" ]] || show_ipv6_choices
   prompt proposed '指定本机 IPv4（回车自动检测）：' "$IPV4" || die '无法读取 IPv4。'; IPV4=$proposed
   do_install
 }
+# --- V2.1: non-destructive diagnostics, REALITY and DNS probes ---
+net_probe() {
+  local v4=${1:-} v6=${2:-} name=${3:-api.ipify.org}
+  info '检查 IPv4 出站和路由：'
+  ip -4 route get 1.1.1.1 || warn '无 IPv4 默认可用路由'
+  if [[ -n "$v4" ]]; then
+    local observed=''
+    observed=$(curl -4fsS --interface "$v4" --max-time 12 https://api.ipify.org 2>/dev/null || true)
+    [[ "$observed" =~ ^[0-9.]+$ ]] && info "绑定 IPv4 源地址的出口：$observed" || warn "绑定 IPv4 $v4 出站失败"
+  fi
+  info '检查 IPv6 默认路由和地址：'
+  ip -6 route show default || true
+  ip -6 -o addr show scope global || true
+  [[ -z "$v6" ]] || ip -6 route get 2606:4700:4700::1111 from "$v6" 2>/dev/null || warn '所选 IPv6 的出站路由检查失败'
+  if getent ahostsv4 "$name" >/dev/null 2>&1; then info "域名 $name 的 IPv4 DNS 查询成功"; else warn "域名 $name 的 IPv4 DNS 查询失败"; fi
+  if curl -4fsS --max-time 9 -H 'accept: application/dns-json' -o /dev/null 'https://1.1.1.1/dns-query?name=example.com&type=A' 2>/dev/null; then
+    info 'DoH (1.1.1.1) HTTPS 连接可达（不代表 DNS 查询结果已验证）'
+  else
+    warn 'DoH (1.1.1.1) 不可达，若选择 DoH 模式可能无法解析'
+  fi
+}
+reality_probe() {
+  local target=$1 result
+  info "检测 REALITY 目标：${target}（IPv4 TLS 1.3、ALPN）"
+  if ! command -v timeout >/dev/null || ! command -v openssl >/dev/null; then
+    warn '缺少 timeout 或 openssl，跳过目标探测'; return 2
+  fi
+  result=$(timeout 12 openssl s_client -4 -connect "${target}:443" -servername "$target" -tls1_3 -alpn 'h2,http/1.1' -brief < /dev/null 2>&1) || {
+    warn "目标 $target 的 TLS 连接失败（只做告警，不阻止安装）"; return 1;
+  }
+  if grep -Eqi 'Protocol version: TLSv1\.3|Protocol *: TLSv1\.3' <<< "$result"; then
+    info 'TLS 1.3 握手成功'
+  else
+    warn '没有检测到 TLS 1.3，建议换目标'; return 1
+  fi
+  if grep -Eqi 'ALPN protocol: h2' <<< "$result"; then info 'ALPN h2 已协商'; else warn '未协商 h2，需通过完整代理自检确认可用'; fi
+  return 0
+}
+show_ipv6_choices() {
+  local -a choices=()
+  local candidate ans n=0
+  mapfile -t choices < <(ip -6 -o addr show scope global | python3 -c '
+import ipaddress,sys
+seen=set()
+for line in sys.stdin:
+    cols=line.split()
+    if any(x in cols for x in ("temporary", "tentative", "dadfailed", "deprecated")): continue
+    try:
+        addr=str(ipaddress.ip_interface(cols[cols.index("inet6")+1]).ip)
+        if ipaddress.IPv6Address(addr).is_global and addr not in seen:
+            print(addr);seen.add(addr)
+    except (ValueError,IndexError):pass
+')
+  (( ${#choices[@]} > 0 )) || die '没有可选的公网 IPv6'
+  if (( ${#choices[@]} == 1 )); then IPV6=${choices[0]}; info "自动选择 IPv6：$IPV6"; return; fi
+  info '检测到多个公网 IPv6，请选入站地址（需外部可达）：'
+  for candidate in "${choices[@]}"; do n=$((n+1)); printf ' %s) %s\n' "$n" "$candidate"; done
+  prompt ans "选择 [1-${#choices[@]}，回车默认 1]：" '1' || die '无法读取 IPv6 选项'
+  [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#choices[@]} )) || die '无效 IPv6 选项'
+  IPV6=${choices[$((ans-1))]}
+}
+self_test() (
+  set -Eeuo pipefail
+  check_installed
+  local tmp pid='' socks port expected result attempts=0
+  tmp=$(mktemp -d /tmp/xray-v6v4-test.XXXXXXXX) || die '无法创建临时测试目录'
+  chmod 700 "$tmp"
+  trap '[[ -z "${pid:-}" ]] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; rm -rf -- "$tmp"' EXIT
+  port=$(python3 - <<'PY'
+import socket
+s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()
+PY
+)
+  python3 - "$CONF" "$CLIENT" "$tmp/client.json" "$port" <<'PY'
+import json,sys,urllib.parse
+conf,client,out,port=sys.argv[1:]
+c=json.load(open(conf,encoding='utf-8'))
+links=[x.strip() for x in open(client,encoding='utf-8') if x.startswith('vless://')]
+assert len(links)==1,'节点链接数量异常'
+p=urllib.parse.urlsplit(links[0]);q=urllib.parse.parse_qs(p.query)
+i=c['inbounds'][0];r=i['streamSettings']['realitySettings'];u=i['settings']['users'][0]
+assert p.username==u['id'] and p.hostname==i['listen'] and p.port==i['port'],'客户端与服务端参数不一致'
+assert q.get('sni')==r['serverNames'] and q.get('sid')==r['shortIds'],'SNI/Short ID 不一致'
+key=q.get('pbk',[''])[0]
+assert key,'节点缺少 REALITY 公钥'
+obj={'log':{'loglevel':'warning'},'inbounds':[{'listen':'127.0.0.1','port':int(port),'protocol':'socks','settings':{'auth':'noauth','udp':False}}],
+'outbounds':[{'tag':'proxy','protocol':'vless','settings':{'address':i['listen'],'port':i['port'],'id':u['id'],'encryption':'none','flow':'xtls-rprx-vision'},'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'fingerprint':'chrome','serverName':r['serverNames'][0],'password':key,'shortId':r['shortIds'][0]}}}]}
+with open(out,'w') as f:json.dump(obj,f)
+PY
+  xray run -test -config "$tmp/client.json" > "$tmp/check.log" 2>&1 || { warn '临时客户端配置校验失败'; tail -n 12 "$tmp/check.log"; exit 1; }
+  xray run -config "$tmp/client.json" > "$tmp/xray.log" 2>&1 & pid=$!
+  while (( attempts < 20 )); do
+    kill -0 "$pid" 2>/dev/null || { warn '临时客户端进程退出'; tail -n 12 "$tmp/xray.log"; exit 1; }
+    ss -H -ltn "sport = :$port" | grep -q '127.0.0.1' && break
+    sleep 0.2; attempts=$((attempts+1))
+  done
+  if (( attempts == 20 )); then warn '临时 SOCKS5 端口没有启动'; tail -n 12 "$tmp/xray.log"; exit 1; fi
+  info '通过临时 SOCKS5 → REALITY → Freedom 发起完整 HTTPS 请求...'
+  expected=$(curl -4fsS --max-time 12 --noproxy '*' https://api.ipify.org 2>/dev/null || true)
+  result=$(curl -fsS --max-time 18 --proxy "socks5h://127.0.0.1:$port" --noproxy '' https://api.ipify.org 2> "$tmp/curl.log") || {
+    warn '代理端到端请求失败；可能是 REALITY 握手、DNS、IPv4 绑定或目标访问问题'
+    sed -n '1,8p' "$tmp/curl.log" | sed -E 's/[0-9a-fA-F:]{20,}/[REDACTED]/g'
+    tail -n 12 "$tmp/xray.log" | sed -E 's/[0-9a-fA-F:]{20,}/[REDACTED]/g'
+    exit 1
+  }
+  [[ "$result" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn '代理返回结果不是 IPv4 地址'; exit 1; }
+  if [[ "$result" != "$expected" ]]; then
+    warn "代理出口为 ${result}，但 VPS 直连出口为 ${expected:-未知}，需核实 NAT/路由"; exit 1
+  fi
+  info "本机端到端代理测试成功；代理公网出口：$result"
+  warn '仅证明 VPS 本机经 IPv6 回环/本地路由可连接；不证明手机从公网 IPv6 可以连接'
+)
+full_diagnose() {
+  check_installed
+  read_config
+  info '========== IPv6→IPv4 一键诊断 =========='
+  systemctl is-active --quiet "$SERVICE" && info 'systemd 服务运行正常' || warn 'Xray 服务不在运行'
+  ss -6 -H -ltn "sport = :${C[2]}" | grep -q "${C[0]}" && info "IPv6 监听存在：${C[0]}:${C[2]}" || warn '没有发现预期 IPv6 监听'
+  net_probe "${C[1]}" "${C[0]}"
+  reality_probe "${C[6]}" || true
+  if ! self_test; then warn '端到端代理测试失败，请检查日志和手机网络'; fi
+  info '外部测试：使用具备 IPv6 的客户端访问 VPS IPv6 TCP 端口；本机测试无法替代公网验证'
+  warn '外网全红需检查 VPS 商家防火墙、nftables 和客户端 IPv6 路由；不要清空防火墙'
+}
+update_config_field() {
+  check_installed
+  local mode=$1 value=$2 tmp prev
+  tmp=$(mktemp "$DIR/.change.XXXXXXXX") || die '无法创建配置暂存文件'
+  python3 - "$CONF" "$tmp" "$mode" "$value" <<'PY'
+import json,sys
+src,dst,mode,value=sys.argv[1:]
+c=json.load(open(src))
+if mode=='dns':
+    if value=='udp': c['dns']={'servers':['1.1.1.1','8.8.8.8'],'queryStrategy':'UseIPv4'}
+    elif value=='doh':c['dns']={'servers':['https+local://1.1.1.1/dns-query','https+local://8.8.8.8/dns-query'],'queryStrategy':'UseIPv4'}
+    else:raise ValueError('unknown DNS mode')
+elif mode=='log':
+    if value=='info':c['log']={'loglevel':'info','dnsLog':True,'maskAddress':'quarter'}
+    elif value=='warning':c['log']={'loglevel':'warning','dnsLog':False}
+    else:raise ValueError('unknown log level')
+else:raise ValueError('unknown setting')
+with open(dst,'w') as f:json.dump(c,f,indent=2);f.write('\n')
+PY
+  if ! check_config "$tmp"; then rm -f "$tmp"; die '新配置未通过 Xray 检查，保持原配置'; fi
+  backup_now || { rm -f "$tmp"; die '备份失败，拒绝修改'; }
+  prev=$(mktemp "$DIR/.previous.XXXXXXXX")
+  cp -p "$CONF" "$prev" || die '无法保存旧配置'
+  install -o root -g "$NAME" -m 640 "$tmp" "$CONF" || die '无法更新服务配置'
+  if ! systemctl restart "$SERVICE" || { sleep 1; ! systemctl is-active --quiet "$SERVICE"; }; then
+    warn '修改后服务失败，尝试回滚'
+    cp -p "$prev" "$CONF"; systemctl restart "$SERVICE" || warn '回滚重启失败'
+    rm -f "$tmp" "$prev"; return 1
+  fi
+  rm -f "$tmp" "$prev"
+  info "$mode 已切换为 ${value}，节点凭据和二维码保持不变"
+}
+choose_dns() {
+  local mode
+  printf ' 1) UDP DNS（1.1.1.1 / 8.8.8.8）\n 2) DoH（HTTPS+local，端口 443）\n'
+  prompt mode '选择 DNS 模式 [1-2]：' '1' || return 1
+  case "$mode" in 1) update_config_field dns udp;; 2) update_config_field dns doh;; *) warn '无效选项';return 1;; esac
+}
+choose_log() {
+  local mode
+  printf ' 1) 正常日志 warning（推荐）\n 2) 诊断日志 info + dnsLog + 地址脱敏\n'
+  prompt mode '选择日志模式 [1-2]：' '1' || return 1
+  case "$mode" in 1) update_config_field log warning;; 2) update_config_field log info;; *) warn '无效选项';return 1;; esac
+}
+# --- End V2.1 module ---
+
 menu() {
   need_root
   local option sub
@@ -573,9 +754,13 @@ menu() {
  7) 重启节点服务
  8) 备份或恢复配置
  9) 卸载节点（自动备份）
+10) 一键诊断（包含 REALITY 完整代理自检）
+11) 单独执行完整代理自检
+12) 切换 DNS（UDP / DoH）
+13) 设置诊断日志（info / warning）
  0) 退出
 EOF
-    prompt option '请选择 [0-9]：' '' || { warn '无法读取交互输入。'; return 1; }
+    prompt option '请选择 [0-13]：' '' || { warn '无法读取交互输入。'; return 1; }
     case "$option" in
       1) (interactive_install) || warn '安装未完成。' ;;
       2) (show_info) || warn '读取失败。' ;;
@@ -593,8 +778,12 @@ EOF
           *) warn '无效选项。' ;;
         esac ;;
       9) (do_uninstall) || warn '卸载未完成。' ;;
+      10) (full_diagnose) || warn '诊断部分未完成。' ;;
+      11) (self_test) || warn '代理自检未通过。' ;;
+      12) (choose_dns) || warn 'DNS 切换失败。' ;;
+      13) (choose_log) || warn '日志模式切换失败。' ;;
       0) return 0 ;;
-      *) warn '请输入 0–9。' ;;
+      *) warn '请输入 0–13。' ;;
     esac
     pause_menu
   done
@@ -627,6 +816,10 @@ main() {
     install) do_install;;
     show|qr) show_info;;
     status) do_status;;
+    diagnose) full_diagnose;;
+    selftest) self_test;;
+    dns) choose_dns;;
+    log) choose_log;;
     port) if ((PORT_SET)); then change_port "$PORT"; else change_port; fi;;
     sni) if ((SNI_SET)); then change_sni "$SNI"; else change_sni; fi;;
     rotate) rotate_keys;;
