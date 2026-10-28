@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.1.0
+SCRIPT_VERSION=2.1.1
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -284,7 +284,10 @@ PY
 )
   ((${#C[@]} == 7)) || die '配置格式不完整。'
 }
-check_config() { xray run -test -config "$1" >/dev/null; }
+# Xray defaults to format=auto and identifies configs by extension.
+# Our atomic staging files (.change.XXXX etc.) intentionally have no .json suffix.
+# Explicit JSON format is mandatory for both DNS/log changes and restores.
+check_config() { xray run -test -format json -config "$1" >/dev/null; }
 check_installed() { exists || die '尚未完整安装；请先运行 install。'; }
 create_user() {
   [[ "$NAME" == 'xray-v6v4' ]] || die '内部服务名称异常，拒绝创建系统账户。'
