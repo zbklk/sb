@@ -1,0 +1,31 @@
+name: SS2022 IPv6-in IPv4-out installer checks
+on:
+  push:
+    paths:
+      - "shadowsocks2022-v6in-v4out/**"
+      - ".github/workflows/ss2022-v6v4.yml"
+  pull_request:
+    paths:
+      - "shadowsocks2022-v6in-v4out/**"
+      - ".github/workflows/ss2022-v6v4.yml"
+  workflow_dispatch:
+
+jobs:
+  syntax-config-and-xray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download pinned official Xray 26.10.21 test binary
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip" \
+            -o /tmp/xray-v26.10.21.zip
+          mkdir -p /tmp/ss2022-xray
+          unzip -q /tmp/xray-v26.10.21.zip xray -d /tmp/ss2022-xray
+          chmod +x /tmp/ss2022-xray/xray
+          echo "/tmp/ss2022-xray" >> "$GITHUB_PATH"
+      - name: Validate syntax, generated Shadowsocks 2022 JSON and client URI
+        run: |
+          python3 -m unittest discover -s shadowsocks2022-v6in-v4out/tests -v
