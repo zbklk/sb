@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.0.1
+SCRIPT_VERSION=2.0.2
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -65,6 +65,9 @@ pause_menu() { local answer; prompt answer '按回车继续...' '' || true; }
 
 need_system() {
   [[ -r /etc/os-release ]] || die '找不到 /etc/os-release。'
+  # /etc/os-release defines NAME="Debian GNU/Linux" or NAME="Ubuntu".
+  # Keep its variables local so they cannot overwrite our service NAME.
+  local ID NAME
   # shellcheck source=/dev/null
   . /etc/os-release
   case "$ID" in debian|ubuntu) ;; *) die "仅支持 Debian/Ubuntu，目前为 $ID。";; esac
@@ -277,8 +280,15 @@ PY
 check_config() { xray run -test -config "$1" >/dev/null; }
 check_installed() { exists || die '尚未完整安装；请先运行 install。'; }
 create_user() {
-  getent group "$NAME" >/dev/null 2>&1 || groupadd --system "$NAME"
-  id "$NAME" >/dev/null 2>&1 || useradd --system --no-create-home --gid "$NAME" --shell /usr/sbin/nologin "$NAME"
+  [[ "$NAME" == 'xray-v6v4' ]] || die '内部服务名称异常，拒绝创建系统账户。'
+  if ! getent group "$NAME" >/dev/null 2>&1; then
+    groupadd --system "$NAME" || die "创建系统组 $NAME 失败，安装中止。"
+  fi
+  if ! id "$NAME" >/dev/null 2>&1; then
+    useradd --system --no-create-home --gid "$NAME" --shell /usr/sbin/nologin "$NAME" || die "创建服务账户 $NAME 失败，安装中止。"
+  fi
+  getent group "$NAME" >/dev/null 2>&1 || die "系统组 $NAME 不存在。"
+  id "$NAME" >/dev/null 2>&1 || die "服务账户 $NAME 不存在。"
 }
 unit_create() {
   local bin
@@ -350,18 +360,19 @@ do_install() {
   ensure_xray
   keys
   create_user
-  mkdir -p "$DIR"
-  chown "root:$NAME" "$DIR"; chmod 750 "$DIR"
+  mkdir -p "$DIR" || die '无法创建节点配置目录。'
+  chown "root:$NAME" "$DIR" || die '节点目录属组设置失败。'
+  chmod 750 "$DIR" || die '节点目录权限设置失败。' 
   local stage
   stage=$(mktemp -d "$DIR/.stage.XXXXXXXX")
   trap "rm -rf -- '$stage'" EXIT
   write_config "$stage/config.json" "$IPV6" "$IPV4" "$PORT" "$UUID" "$PRIVATE" "$SHORT" "$SNI"
   check_config "$stage/config.json" || die 'Xray-core 不接受当前配置，请检查版本和 SNI。'
   write_client "$stage/config.json" "$PUBLIC" "$stage/client.txt"
-  install -o root -g "$NAME" -m 640 "$stage/config.json" "$CONF"
-  install -o root -g root -m 600 "$stage/client.txt" "$CLIENT"
-  unit_create
-  systemctl daemon-reload
+  install -o root -g "$NAME" -m 640 "$stage/config.json" "$CONF" || die '写入 Xray 服务配置失败。'
+  install -o root -g root -m 600 "$stage/client.txt" "$CLIENT" || die '写入客户端配置失败。' 
+  unit_create || die '写入 systemd 服务文件失败。'
+  systemctl daemon-reload || die 'systemd 重新加载失败。'
   if ! systemctl enable --now "$SERVICE" || ! systemctl is-active --quiet "$SERVICE"; then
     journalctl -u "$SERVICE" --no-pager -n 30 >&2 || true
     systemctl disable --now "$SERVICE" 2>/dev/null || true
