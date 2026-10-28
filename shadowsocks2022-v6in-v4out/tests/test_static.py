@@ -1,6 +1,7 @@
 """Offline structural/regression tests for the independent SS2022 installer."""
 import base64
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -64,6 +65,28 @@ class ShadowsocksInstallerTests(unittest.TestCase):
             self.assertEqual(outbound["streamSettings"]["sockopt"]["domainStrategy"], "ForceIPv4")
             self.assertEqual(c["routing"]["rules"][0]["outboundTag"], "ipv4-direct")
             self.assertEqual(c["dns"]["queryStrategy"], "UseIPv4")
+
+            if shutil.which("xray"):
+                server_check = subprocess.run(
+                    ["xray", "run", "-test", "-format", "json", "-config", str(config)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(server_check.returncode, 0, server_check.stderr + server_check.stdout)
+                proxy_client = {
+                    "inbounds": [{"listen": "127.0.0.1", "port": 24567, "protocol": "socks", "settings": {"auth": "noauth"}}],
+                    "outbounds": [{"protocol": "shadowsocks", "settings": {
+                        "address": inbound["listen"], "port": inbound["port"],
+                        "method": inbound["settings"]["method"],
+                        "password": inbound["settings"]["password"],
+                    }}],
+                }
+                proxy_file = Path(temp) / "proxy-client.json"
+                proxy_file.write_text(json.dumps(proxy_client), encoding="utf-8")
+                client_check = subprocess.run(
+                    ["xray", "run", "-test", "-format", "json", "-config", str(proxy_file)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(client_check.returncode, 0, client_check.stderr + client_check.stdout)
 
             self.invoke('make_client "$1" "$2"', config, client)
             line = next(line for line in client.read_text(encoding="utf-8").splitlines() if line.startswith("ss://"))
