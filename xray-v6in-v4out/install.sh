@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.0.2
+SCRIPT_VERSION=2.0.3
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -70,7 +70,7 @@ need_system() {
   local ID NAME
   # shellcheck source=/dev/null
   . /etc/os-release
-  case "$ID" in debian|ubuntu) ;; *) die "仅支持 Debian/Ubuntu，目前为 $ID。";; esac
+  case "$ID" in debian|ubuntu) ;; *) die "仅支持 Debian/Ubuntu，目前为 ${ID}。";; esac
   command -v systemctl >/dev/null || die '需要 systemd 环境。'
 }
 ensure_dependencies() {
@@ -321,7 +321,7 @@ EOF
 }
 firewall_hint() {
   local port=$1 ipv6=$2
-  warn "请在服务商安全组/防火墙开放 IPv6 TCP $port；无需开放 TCP 80。"
+  warn "请在服务商安全组/防火墙开放 IPv6 TCP ${port}；无需开放 TCP 80。"
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     warn "检测到 UFW 已启用；确认 SSH 已放行后，可执行：ufw allow in to $ipv6 port $port proto tcp"
   fi
@@ -335,7 +335,7 @@ backup_now() {
     rm -f "$outfile"; die '备份失败。'
   fi
   chmod 600 "$outfile"
-  info "已备份到：$outfile（含 REALITY 私钥，禁止公开上传）"
+  info "已备份到：${outfile}（含 REALITY 私钥，禁止公开上传）"
 }
 do_install() {
   if [[ -e "$UNIT" || -e "$CONF" || -e "$CLIENT" ]]; then
