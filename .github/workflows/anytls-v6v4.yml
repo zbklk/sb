@@ -1,0 +1,35 @@
+name: AnyTLS IPv6-in IPv4-out checks
+on:
+  push:
+    paths:
+      - 'anytls-v6in-v4out/**'
+      - '.github/workflows/anytls-v6v4.yml'
+  pull_request:
+    paths:
+      - 'anytls-v6in-v4out/**'
+      - '.github/workflows/anytls-v6v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loopback-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax and ShellCheck
+        run: |
+          bash -n anytls-v6in-v4out/install.sh
+          shellcheck anytls-v6in-v4out/install.sh
+          bash anytls-v6in-v4out/install.sh --help
+      - name: Download and verify pinned official sing-box 1.14.4
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 3 --max-time 180 https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz -o /tmp/sing-box.tar.gz
+          echo '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968  /tmp/sing-box.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          echo "SING_BOX=/tmp/sing-box-1.14.4-linux-amd64/sing-box" >> "$GITHUB_ENV"
+      - name: Real AnyTLS IPv6 loopback, IPv4 DNS/egress, and TLS/authentication checks
+        run: python3 -m unittest discover -s anytls-v6in-v4out/tests -v
