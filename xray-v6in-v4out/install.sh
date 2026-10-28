@@ -374,9 +374,9 @@ do_install() {
   local stage
   stage=$(mktemp -d "$DIR/.stage.XXXXXXXX")
   trap "rm -rf -- '$stage'" EXIT
-  write_config "$stage/config.json" "$IPV6" "$IPV4" "$PORT" "$UUID" "$PRIVATE" "$SHORT" "$SNI"
+  write_config "$stage/config.json" "$IPV6" "$IPV4" "$PORT" "$UUID" "$PRIVATE" "$SHORT" "$SNI" || die '生成服务端配置失败'
   check_config "$stage/config.json" || die 'Xray-core 不接受当前配置，请检查版本和 SNI。'
-  write_client "$stage/config.json" "$PUBLIC" "$stage/client.txt"
+  write_client "$stage/config.json" "$PUBLIC" "$stage/client.txt" || die '生成客户端链接失败'
   install -o root -g "$NAME" -m 640 "$stage/config.json" "$CONF" || die '写入 Xray 服务配置失败。'
   install -o root -g root -m 600 "$stage/client.txt" "$CLIENT" || die '写入客户端配置失败。' 
   unit_create || die '写入 systemd 服务文件失败。'
@@ -402,13 +402,17 @@ apply_config() {
   check_installed
   check_config "$staged_config" || die '新配置检查未通过，旧节点保持不变。'
   dir=$(mktemp -d "$DIR/.rollback.XXXXXXXX")
-  cp -p "$CONF" "$dir/config.json"
-  cp -p "$CLIENT" "$dir/client.txt"
+  cp -p "$CONF" "$dir/config.json" || die '备份旧配置失败，拒绝修改'
+  cp -p "$CLIENT" "$dir/client.txt" || die '备份客户端配置失败，拒绝修改'
   staged_client="$dir/new-client.txt"
-  write_client "$staged_config" "$staged_public" "$staged_client"
-  backup_now
-  install -o root -g "$NAME" -m 640 "$staged_config" "$CONF"
-  install -o root -g root -m 600 "$staged_client" "$CLIENT"
+  write_client "$staged_config" "$staged_public" "$staged_client" || die '生成新的客户端链接失败'
+  backup_now || die '修改前备份失败，拒绝修改'
+  install -o root -g "$NAME" -m 640 "$staged_config" "$CONF" || die '更新服务端配置失败'
+  if ! install -o root -g root -m 600 "$staged_client" "$CLIENT"; then
+    cp -p "$dir/config.json" "$CONF" || warn '旧配置恢复失败'
+    cp -p "$dir/client.txt" "$CLIENT" || warn '旧客户端配置恢复失败'
+    die '客户端文件写入失败，已尝试恢复原配置'
+  fi
   if ! systemctl restart "$SERVICE" || { sleep 1; ! systemctl is-active --quiet "$SERVICE"; }; then
     warn '新节点启动失败，正在恢复上次配置。'
     cp -p "$dir/config.json" "$CONF"
@@ -529,12 +533,16 @@ c=json.load(open(sys.argv[1]));print(c['inbounds'][0]['listen']);print(c['outbou
 PY
   mapfile -t ADDRS < "$extracted/addresses"
   validate_addresses "${ADDRS[0]}" "${ADDRS[1]}"
-  backup_now
+  backup_now || die '恢复前备份失败，拒绝覆盖'
   local olddir
   olddir=$(mktemp -d "$DIR/.before-restore.XXXXXXXX")
   cp -p "$CONF" "$olddir/config.json"; cp -p "$CLIENT" "$olddir/client.txt"
-  install -o root -g "$NAME" -m 640 "$extracted/config.json" "$CONF"
-  install -o root -g root -m 600 "$extracted/client.txt" "$CLIENT"
+  install -o root -g "$NAME" -m 640 "$extracted/config.json" "$CONF" || die '恢复服务端配置写入失败'
+  if ! install -o root -g root -m 600 "$extracted/client.txt" "$CLIENT"; then
+    cp -p "$olddir/config.json" "$CONF" || warn '恢复旧服务端配置失败'
+    cp -p "$olddir/client.txt" "$CLIENT" || warn '恢复旧客户端配置失败'
+    die '恢复客户端链接文件失败，已尝试回滚'
+  fi
   if ! systemctl restart "$SERVICE" || { sleep 1; ! systemctl is-active --quiet "$SERVICE"; }; then
     warn '备份恢复后服务未启动，执行回滚。'
     cp -p "$olddir/config.json" "$CONF"; cp -p "$olddir/client.txt" "$CLIENT"
