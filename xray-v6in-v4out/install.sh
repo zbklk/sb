@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.0.0
+SCRIPT_VERSION=2.0.1
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -146,14 +146,46 @@ ensure_xray() {
   command -v xray >/dev/null || die '未找到 xray 可执行文件。'
 }
 keys() {
-  local text
-  UUID="$(xray uuid | tr -d '\r\n')"
-  text="$(xray x25519)"
-  PRIVATE="$(printf '%s\n' "$text" | sed -nE '/^[[:space:]]*Private[Kk]ey:/ {s/^[^:]*:[[:space:]]*//;p;q;}')"
-  PUBLIC="$(printf '%s\n' "$text" | sed -nE '/^[[:space:]]*(Password|Public[Kk]ey):/ {s/^[^:]*:[[:space:]]*//;p;q;}')"
-  SHORT="$(openssl rand -hex 8)"
-  [[ -n "$UUID" && -n "$PRIVATE" && -n "$PUBLIC" && -n "$SHORT" ]] || die 'UUID/REALITY 密钥生成失败。'
+  local output parsed
+  local -a pair=()
+  UUID="$(xray uuid | tr -d '\r\n')" || die 'Xray UUID 命令执行失败。'
+  [[ "$UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || die 'Xray 返回的 UUID 格式无效。'
+  output="$(xray x25519)" || die 'Xray REALITY 密钥生成命令执行失败。'
+  # Xray versions use Private key / Public key, PrivateKey / Password,
+  # or PrivateKey / Password (PublicKey). Parse labels, not line positions.
+  if ! parsed="$(printf '%s\n' "$output" | python3 -c '
+import base64, re, sys
+values = {}
+for line in sys.stdin:
+    match = re.match(r"^\s*([^:]+):\s*(\S+)\s*$", line)
+    if not match:
+        continue
+    label = re.sub(r"[^a-z]", "", match.group(1).lower())
+    if label.startswith("privatekey"):
+        values["private"] = match.group(2)
+    elif label.startswith("password") or label.startswith("publickey"):
+        values["public"] = match.group(2)
+for name in ("private", "public"):
+    key = values.get(name, "")
+    try:
+        raw = base64.b64decode(key.replace("-", "+").replace("_", "/") + "=" * (-len(key) % 4), validate=True)
+    except (ValueError, base64.binascii.Error):
+        sys.exit("invalid REALITY key " + name)
+    if len(raw) != 32:
+        sys.exit("invalid REALITY key length " + name)
+print(values["private"])
+print(values["public"])
+')"; then
+    die '无法识别 Xray REALITY 密钥输出格式。请检查 xray x25519 的字段名称（不要公开私钥）。'
+  fi
+  mapfile -t pair <<< "$parsed"
+  ((${#pair[@]} == 2)) || die 'REALITY 密钥字段数量错误。'
+  PRIVATE="${pair[0]}"
+  PUBLIC="${pair[1]}"
+  SHORT="$(openssl rand -hex 8)" || die '生成 Short ID 失败。'
+  [[ "$SHORT" =~ ^[[:xdigit:]]{16}$ ]] || die '生成的 Short ID 格式错误。'
 }
+
 # The public REALITY key is embedded in the previously generated client link.
 client_public() {
   python3 - "$CLIENT" <<'PY'
