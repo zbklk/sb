@@ -46,7 +46,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zbklk/sb/main/xray-v6in-v4ou
 运行后会显示：
 
 ```text
-======= Xray IPv6 入站 → IPv4 出站 V2.0.0 =======
+======= Xray IPv6 入站 → IPv4 出站 V2.0.1 =======
 1) 一键安装节点（安装成功自动显示二维码）
 2) 查看节点信息及二维码
 3) 修改监听端口
@@ -171,3 +171,11 @@ A：不会。`ForceIPv4` 只约束这里的 Freedom 出站连接，IPv6-only 目
 - [XTLS 官方安装脚本](https://github.com/XTLS/Xray-install)
 
 本项目为自用部署辅助工具；请阅读代码后在自己的 VPS 上执行。尚未在所有商家的 VPS 网络中进行完整连接实测，使用前建议对现有业务配置作快照。
+
+## V2.0.1 修复说明（2026-10-28）
+
+- 修复 Xray v26.10.21 的 `xray x25519` 输出 `Password (PublicKey):` 时，V2.0.0 报 `UUID/REALITY 密钥生成失败` 的问题。
+- 同时兼容旧格式 `Private key: / Public key:`、中间版本 `PrivateKey: / Password:`，以及新格式 `PrivateKey: / Password (PublicKey):`。
+- 检查 UUID 格式及 X25519 密钥是否是有效的 32 字节数据；不再只依赖固定标签字符串或输出行号。
+- 如果原来停在密钥生成失败阶段，**重新运行菜单并选择 1 安装**即可；不需要卸载已安装的 Xray 核心，不会重设 VPS 网络。
+- XTLS 官方安装器可能同时启用了默认的 `xray.service`；本项目的服务名是 `xray-v6v4.service`，两个服务相互独立。请勿在确认其他节点用途之前随意停用/删除 `xray.service`。
