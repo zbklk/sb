@@ -1,5 +1,7 @@
 # Xray IPv6 入站 / IPv4 出站 — VLESS + REALITY + Vision（V2）
 
+> 当前版本：**V2.0.2**（修复 Debian/Ubuntu 服务账户名冲突）
+
 使用 **VPS 的公网 IPv6 接收客户端连接**，代理出站**绑定 VPS 本机 IPv4**（支持 NAT 内网 IPv4 再经商家出口 NAT）。脚本适用于 Debian / Ubuntu + systemd。V2 新增**中文数字菜单、安装完成自动展示二维码、端口和 SNI 在线修改、重置密钥、备份/恢复、独立卸载**。
 
 > **无需自己的域名、DNS A/AAAA 解析、TLS 证书或 TCP 80 端口。** 客户端可以直接填写 VPS 公网 IPv6；REALITY 的 SNI 是独立的真实 TLS 目标域名（默认 `www.microsoft.com`），不要解析到你的 VPS。若需要用自己的域名作为*客户端连接地址*，可另外添加 AAAA 记录，但不是必要条件。
@@ -171,6 +173,14 @@ A：不会。`ForceIPv4` 只约束这里的 Freedom 出站连接，IPv6-only 目
 - [XTLS 官方安装脚本](https://github.com/XTLS/Xray-install)
 
 本项目为自用部署辅助工具；请阅读代码后在自己的 VPS 上执行。尚未在所有商家的 VPS 网络中进行完整连接实测，使用前建议对现有业务配置作快照。
+
+## V2.0.2 修复说明（2026-10-28）
+
+- 修复 Debian/Ubuntu 的 `/etc/os-release` 中 `NAME="Debian GNU/Linux"` 覆盖脚本服务名 `xray-v6v4` 的问题，避免出现 `groupadd: 'Debian GNU/Linux' is not a valid group name` 和 `Invalid user/group name`。
+- 系统发行版信息改为函数内部局部变量，保证 `xray-v6v4` 服务名及系统账户不受影响。
+- 新增创建用户组、配置文件写入、服务文件加载的显式错误检查；失败时尽早停止，不继续使用错误账户名。
+- 如果 V2.0.1 曾经安装失败并输出“已删除本次创建的服务及节点配置”，无需卸载 Xray-core。重新获取 V2.0.2，并从菜单选择 `1` 即可。
+- 若已在服务器保存旧版本本地脚本，例如 `/root/xray-v6v4-install.sh`，请重新下载；重新执行旧的本地文件不会自动升级脚本。
 
 ## V2.0.1 修复说明（2026-10-28）
 
