@@ -3,16 +3,24 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=1.0.1
+VERSION=1.1.0
 CORE_VERSION=1.14.4
-NAME=anytls-v6v4
-DIR=/etc/$NAME
-BIN_DIR=/opt/$NAME
+BASE_NAME=anytls-v6v4
+CONFIG_ROOT=/etc
+BINARY_ROOT=/opt
+UNIT_ROOT=/etc/systemd/system
+NAME=$BASE_NAME
+DIR=$CONFIG_ROOT/$NAME
+BIN_DIR=$BINARY_ROOT/$NAME
 BIN=$BIN_DIR/sing-box
 CONF=$DIR/config.json
-UNIT=/etc/systemd/system/$NAME.service
+UNIT=$UNIT_ROOT/$NAME.service
 SERVICE=$NAME.service
 PORT=38445
+PORT_SET=0
+NODE_ID=default
+NODE_LABEL=
+ALLOW_INSECURE=0
 IPV6=
 IPV4=
 SERVER_NAME=anytls.invalid
@@ -24,6 +32,50 @@ info() { printf '[信息] %s\n' "$*"; }
 die() { printf '[错误] %s\n' "$*" >&2; exit 1; }
 need_root() { (( EUID == 0 )) || die '请使用 root 执行'; }
 installed() { [[ -f "$CONF" && -x "$BIN" && -f "$UNIT" ]]; }
+select_node() {
+  local id=$1
+  [[ "$id" =~ ^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$ ]] || die '节点 ID 须为 1–20 位小写字母/数字/中间连字符'
+  NODE_ID=$id
+  NAME=$BASE_NAME
+  [[ "$id" == default ]] || NAME=$BASE_NAME-$id
+  DIR=$CONFIG_ROOT/$NAME
+  BIN_DIR=$BINARY_ROOT/$NAME
+  BIN=$BIN_DIR/sing-box
+  CONF=$DIR/config.json
+  UNIT=$UNIT_ROOT/$NAME.service
+  SERVICE=$NAME.service
+}
+suggest_port() {
+  python3 - "$CONFIG_ROOT" "$BASE_NAME" <<'PY'
+import json,pathlib,sys
+ports=[]
+for p in pathlib.Path(sys.argv[1]).glob(sys.argv[2]+"*/config.json"):
+    try: ports.extend(i["listen_port"] for i in json.loads(p.read_text())["inbounds"])
+    except (OSError,ValueError,KeyError,TypeError): pass
+print(max([38444]+ports)+1 if max([38444]+ports)<65535 else 38446)
+PY
+}
+list_nodes() {
+  python3 - "$CONFIG_ROOT" "$BASE_NAME" <<'PY'
+import json,pathlib,re,subprocess,sys
+root,base=pathlib.Path(sys.argv[1]),sys.argv[2]
+print("ID\t名称\tIPv6:端口\t服务状态")
+count=0
+for folder in sorted(root.glob(base+"*")):
+    identifier="default" if folder.name==base else folder.name.removeprefix(base+"-")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,18}[a-z0-9])?",identifier): continue
+    try:
+        c=json.loads((folder/"config.json").read_text());i=c["inbounds"][0]
+        if i["type"]!="anytls": continue
+        label=(folder/"node-name").read_text().strip() if (folder/"node-name").is_file() else "AnyTLS-"+identifier
+        label="".join(ch if ch.isprintable() else " " for ch in label)
+        state=subprocess.run(["systemctl","is-active",folder.name+".service"],capture_output=True,text=True).stdout.strip()
+        print(f'{identifier}\t{label}\t[{i["listen"]}]:{i["listen_port"]}\t{state or "unknown"}')
+        count+=1
+    except (OSError,ValueError,KeyError,TypeError): continue
+if not count: print("尚未发现已安装节点。")
+PY
+}
 require_install_deps() {
   [[ -d /run/systemd/system ]] || die '需要已启动 systemd 的 Debian/Ubuntu VPS'
   local command_name missing=0
@@ -65,6 +117,12 @@ for flag,address in (("-6",v6),("-4",v4)):
     interfaces=json.loads(subprocess.check_output(["ip",flag,"-j","addr","show"]))
     if not any(ipaddress.ip_address(a["local"])==address for i in interfaces for a in i.get("addr_info",[])):
         sys.exit(f"地址未配置到本机网卡：{address}")
+PY
+  python3 - "${NODE_LABEL:-AnyTLS-$NODE_ID}" <<'PY'
+import sys
+label=sys.argv[1]
+if not 1<=len(label)<=64 or not all(ch.isprintable() for ch in label):
+    sys.exit("节点名称须为 1–64 个可打印字符")
 PY
   [[ -z "$CERT" && -z "$KEY" || -n "$CERT" && -n "$KEY" ]] || die '--cert 和 --key 必须一起提供'
   if [[ -n "$CERT" ]]; then
@@ -138,7 +196,7 @@ for name,config in (("config.json",server),("client.json",client)):
 uri="anytls://"+urllib.parse.quote(password,safe="")+f"@[{v6}]:{port}?"+urllib.parse.urlencode({"sni":sni})+"#AnyTLS-IPv6-to-IPv4"
 text=f"AnyTLS | IPv6 入站 / IPv4 出站\n服务器: {v6}\n端口: {port} (TCP)\n密码: {password}\nSNI: {sni}\n绑定本机 IPv4 出站: {v4}\n"
 if self_signed=="1":
-    text+="自签证书模式：请使用 client.json（已嵌入信任证书），或在客户端显式信任 server.crt。\n不提供跳过证书验证的导入链接。\n"
+    text+="自签证书模式：请使用 client.json（已嵌入信任证书），或在客户端显式信任 server.crt。\n二维码请使用 qr 命令；自签兼容扫码须明确添加 --allow-insecure。\n"
 else:
     text+="公开 CA 证书模式；请核对客户端支持 AnyTLS 和完整证书校验。\n"+uri+"\n"
 (output/"client.txt").write_text(text,encoding="utf-8")
@@ -177,7 +235,7 @@ EOF
 }
 save_failure_diagnostics() {
   local report
-  report=$(mktemp "/root/anytls-v6v4-failure-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.log") || return 1
+  report=$(mktemp "/root/$NAME-failure-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.log") || return 1
   {
     printf 'AnyTLS installer %s / sing-box %s\n' "$VERSION" "$CORE_VERSION"
     systemctl --no-pager --full status "$SERVICE" || true
@@ -190,7 +248,7 @@ save_failure_diagnostics() {
 }
 do_install() (
   need_root
-  info "AnyTLS 安装器 $VERSION / sing-box $CORE_VERSION"
+  info "AnyTLS 安装器 $VERSION / sing-box $CORE_VERSION / 节点 $NODE_ID"
   [[ ! -e "$DIR" && ! -e "$BIN_DIR" && ! -e "$UNIT" ]] || die '检测到已有 AnyTLS 文件，拒绝覆盖；请使用 show/status/test'
   require_install_deps
   if systemctl cat "$SERVICE" >/dev/null 2>&1; then die '已有同名服务，拒绝覆盖'; fi
@@ -236,6 +294,8 @@ do_install() (
   install -o root -g "$NAME" -m 640 "$stage/config.json" "$CONF"
   install -o root -g root -m 600 "$stage/client.json" "$DIR/client.json"
   install -o root -g root -m 600 "$stage/client.txt" "$DIR/client.txt"
+  printf '%s\n' "${NODE_LABEL:-AnyTLS-$NODE_ID}" > "$DIR/node-name"
+  chmod 600 "$DIR/node-name"
   "$BIN" check -c "$CONF"
   create_unit
   systemctl daemon-reload
@@ -248,9 +308,54 @@ do_install() (
 )
 show_config() {
   installed || die '尚未安装 AnyTLS'
-  cat "$DIR/client.txt"
+  # Suppress the obsolete 1.0.x QR limitation without rewriting existing credentials.
+  sed '/^不提供跳过证书验证的导入链接。$/d' "$DIR/client.txt"
   info "sing-box 客户端完整配置：$DIR/client.json；请私下复制到客户端"
   openssl x509 -in "$DIR/server.crt" -noout -dates -fingerprint -sha256
+  info '严格校验导入链接（自签证书需客户端先显式信任证书）：'
+  share_uri 0
+}
+share_uri() {
+  # Standard AnyTLS URI. Custom CA trust cannot be encoded in the URI.
+  python3 - "$CONF" "$DIR/client.json" "$DIR/node-name" "$NODE_ID" "${1:-0}" <<'PY'
+import json,pathlib,sys,urllib.parse
+config,client,label_file,identifier,insecure=sys.argv[1:]
+c=json.loads(pathlib.Path(config).read_text(encoding="utf-8"))
+json.loads(pathlib.Path(client).read_text(encoding="utf-8"))
+i=c["inbounds"][0]
+if i["type"]!="anytls": sys.exit("不是受支持的 AnyTLS 节点")
+label=pathlib.Path(label_file).read_text(encoding="utf-8").strip() if pathlib.Path(label_file).is_file() else "AnyTLS-"+identifier
+query=urllib.parse.urlencode({"sni":i["tls"]["server_name"],"insecure":"1" if insecure=="1" else "0"})
+password=urllib.parse.quote(i["users"][0]["password"],safe="")
+print(f'anytls://{password}@[{i["listen"]}]:{i["listen_port"]}/?{query}#'+urllib.parse.quote(label,safe=""))
+PY
+}
+ensure_qrencode() {
+  if ! command -v qrencode >/dev/null 2>&1; then
+    info '正在安装二维码工具 qrencode ...'
+    command -v apt-get >/dev/null 2>&1 || die '请先安装 qrencode'
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode
+  fi
+}
+show_qr() {
+  installed || die '尚未安装此节点'
+  local uri mode=strict file
+  if (( ALLOW_INSECURE == 1 )); then
+    mode=insecure
+    info '自签兼容模式：导入链接包含 insecure=1，会关闭客户端 TLS 证书身份校验。'
+  else
+    info '严格校验模式：自签证书需客户端先信任 server.crt；公开 CA 证书可直接导入。'
+  fi
+  ensure_qrencode
+  uri=$(share_uri "$ALLOW_INSECURE")
+  file=$DIR/qr-$mode.png
+  printf '%s' "$uri" | qrencode -t PNG -m 2 -o "$file.tmp"
+  chmod 600 "$file.tmp"
+  mv -f -- "$file.tmp" "$file"
+  printf '\n%s\n\n' "$uri"
+  printf '%s' "$uri" | qrencode -t UTF8 -m 1
+  info "节点 $NODE_ID 二维码 PNG：$file（含节点密码，请私下保存）"
 }
 self_test() (
   installed || die '尚未安装 AnyTLS'
@@ -300,7 +405,7 @@ PY
 do_backup() {
   installed || die '尚未安装 AnyTLS'
   local file
-  file=$(mktemp "/root/anytls-v6v4-backup-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.tar.gz")
+  file=$(mktemp "/root/$NAME-backup-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.tar.gz")
   tar -czf "$file" -C / "etc/$NAME" "etc/systemd/system/$NAME.service"
   chmod 600 "$file"
   info "备份（含密码和私钥）：$file；核心版本 $CORE_VERSION"
@@ -313,37 +418,99 @@ do_uninstall() {
   rm -f -- "$UNIT"
   systemctl daemon-reload
   rm -rf -- "$DIR" "$BIN_DIR"
-  info 'AnyTLS 已卸载；系统账户和备份保留。'
+  info "节点 $NODE_ID 已卸载；系统账户和备份保留，其他节点不受影响。"
+}
+show_menu() {
+  local script_path=${BASH_SOURCE[0]} choice id label port mode answer
+  [[ "$script_path" == /* ]] || script_path=$PWD/$script_path
+  while true; do
+    printf '\n=== AnyTLS 节点管理 %s | IPv6 入站 / IPv4 出站 ===\n' "$VERSION"
+    printf '1) 安装默认节点\n2) 列出节点\n3) 添加独立节点\n4) 节点二维码/导入链接\n5) 查看节点配置\n6) 节点完整自检\n7) 节点状态\n8) 备份节点\n9) 卸载指定节点\n0) 退出\n'
+    read -r -p '请选择 [0-9]：' choice || return 0
+    case "$choice" in
+      0) return 0 ;;
+      1) if bash "$script_path" install; then :; else info '安装失败，菜单继续可用。'; fi ;;
+      2) if bash "$script_path" list; then :; else info '列表查询失败。'; fi ;;
+      3)
+        read -r -p '新节点 ID（小写字母/数字/连字符，例如 phone2）：' id || return 0
+        read -r -p "显示名称 [AnyTLS-$id]：" label || return 0
+        port=$(suggest_port)
+        read -r -p "TCP 端口 [$port]：" answer || return 0
+        port=${answer:-$port}
+        if bash "$script_path" add --node "$id" --name "${label:-AnyTLS-$id}" --port "$port"; then
+          info '节点已添加。可选菜单 4 显示二维码；请放通新端口。'
+        else info '添加失败，已有节点保留。'; fi ;;
+      4|5|6|7|8|9)
+        read -r -p '节点 ID [default]：' id || return 0
+        id=${id:-default}
+        case "$choice" in
+          4)
+            printf '1) 严格证书校验（自签需先信任证书）\n2) 自签兼容扫码（跳过证书校验）\n0) 返回\n'
+            read -r -p '请选择 [0-2]：' mode || return 0
+            case "$mode" in
+              1) if bash "$script_path" qr --node "$id"; then :; else info '二维码生成失败。'; fi ;;
+              2) if bash "$script_path" qr --node "$id" --allow-insecure; then :; else info '二维码生成失败。'; fi ;;
+              0) : ;; *) info '无效选项。' ;;
+            esac ;;
+          5) if bash "$script_path" show --node "$id"; then :; else info '查看失败。'; fi ;;
+          6) if bash "$script_path" test --node "$id"; then :; else info '自检失败。'; fi ;;
+          7) if bash "$script_path" status --node "$id"; then :; else info '状态查询失败。'; fi ;;
+          8) if bash "$script_path" backup --node "$id"; then :; else info '备份失败。'; fi ;;
+          9)
+            read -r -p "仅卸载节点 $id，输入 YES 确认：" answer || return 0
+            if [[ "$answer" == YES ]]; then
+              if bash "$script_path" uninstall --node "$id" --yes; then :; else info '卸载失败。'; fi
+            else info '已取消。'; fi ;;
+        esac ;;
+      *) info '无效选项。' ;;
+    esac
+  done
 }
 usage() {
   cat <<'HELP'
-AnyTLS IPv6-in / IPv4-out v1.0.1 (sing-box 1.14.4)
+AnyTLS IPv6-in / IPv4-out v1.1.0 (sing-box 1.14.4)
+  bash install.sh                         # 交互菜单，已有节点无需重装
   bash install.sh install [--port 38445] [--ipv6 <public-v6>] [--ipv4 <local-v4>]
                           [--server-name node.example.com --cert /path/fullchain.pem --key /path/key.pem]
-  bash install.sh show | status | test | backup
-  bash install.sh uninstall --yes
-默认生成自签证书与显式信任它的 sing-box 客户端 JSON；不跳过证书验证。
+  bash install.sh add --node phone2 [--name 手机2] [--port 38446] [证书/地址参数]
+  bash install.sh list | menu
+  bash install.sh show | status | test | backup [--node default]
+  bash install.sh qr [--node default] [--allow-insecure]
+  bash install.sh uninstall [--node default] --yes
+每个节点有独立的目录、端口、密码和服务。default 兼容 1.0.x 的现有节点。
+默认二维码严格校验证书；--allow-insecure 明确选择自签兼容扫码，关闭客户端证书校验。
 HELP
 }
 main() {
-  local command_name=${1:-help}
+  local command_name=${1:-menu}
   (( $# == 0 )) || shift
   while (( $# )); do
     case "$1" in
-      --port|--ipv6|--ipv4|--server-name|--cert|--key)
+      --port|--ipv6|--ipv4|--server-name|--cert|--key|--node|--name)
         if (( $# < 2 )) || [[ -z "$2" ]]; then die "参数 $1 缺少值"; fi
         case "$1" in
-          --port) PORT=$2 ;; --ipv6) IPV6=$2 ;; --ipv4) IPV4=$2 ;;
+          --port) PORT=$2; PORT_SET=1 ;; --ipv6) IPV6=$2 ;; --ipv4) IPV4=$2 ;;
           --server-name) SERVER_NAME=$2 ;; --cert) CERT=$2 ;; --key) KEY=$2 ;;
+          --node) NODE_ID=$2 ;; --name) NODE_LABEL=$2 ;;
         esac
         shift 2 ;;
       --yes) YES=1; shift ;;
+      --allow-insecure) ALLOW_INSECURE=1; shift ;;
       *) die "未知参数：$1" ;;
     esac
   done
+  select_node "$NODE_ID"
+  if (( ALLOW_INSECURE == 1 )) && [[ "$command_name" != qr ]]; then die '--allow-insecure 仅用于 qr 命令'; fi
   case "$command_name" in
     help|-h|--help) usage ;;
     install) do_install ;;
+    add)
+      [[ "$NODE_ID" != default ]] || die '新增节点请指定 --node ID；default 保留给原有节点'
+      if (( PORT_SET == 0 )); then PORT=$(suggest_port); fi
+      do_install ;;
+    menu) need_root; show_menu ;;
+    list) need_root; list_nodes ;;
+    qr) need_root; show_qr ;;
     show) need_root; show_config ;;
     test|selftest) need_root; self_test ;;
     status) need_root; installed || die '尚未安装'; systemctl --no-pager --full status "$SERVICE" ;;

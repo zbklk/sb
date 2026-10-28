@@ -21,6 +21,16 @@ curl -4fSL --retry 3 https://raw.githubusercontent.com/zbklk/sb/main/anytls-v6in
 
 已有域名和公开 CA 证书时，建议按[完整 README](anytls-v6in-v4out/README.md#使用域名证书)使用证书模式，可生成 `anytls://` 导入链接。自签模式使用生成的 `client.json`，保留 TLS 证书校验。
 
+## 已安装节点：菜单、多节点与二维码
+
+1.1.0 新增交互菜单、独立多节点、终端二维码和 PNG 导出。已有 1.0.x 节点自动识别为 `default`，更新管理脚本后直接进入菜单，无需重新安装节点：
+
+```bash
+curl -4fSL --retry 3 https://raw.githubusercontent.com/zbklk/sb/main/anytls-v6in-v4out/install.sh -o /root/anytls-v6v4-install.sh && bash /root/anytls-v6v4-install.sh menu
+```
+
+选 **4** 显示节点二维码；选 **3** 添加新节点。二维码可选严格证书校验，或明确选择关闭客户端证书校验的自签兼容模式。详见[扫码与多节点说明](anytls-v6in-v4out/README.md#扫码添加与二维码导出)。
+
 AnyTLS 使用 TLS、分包和填充设计缓解流量特征问题，实际抗封锁效果取决于网络环境，不能保证不被识别或封锁。见 [AnyTLS 项目](https://github.com/anytls/anytls-go)。
 
 本次新增的 `anytls-v6in-v4out/` 使用独立服务和目录。旧版根目录安装器仍保留，使用前请分别阅读对应脚本；本首页的网络约束仅描述上述独立方案。

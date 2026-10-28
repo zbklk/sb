@@ -1,6 +1,8 @@
 # AnyTLS：公网 IPv6 入站 → IPv4 出站
 
-版本 **1.0.1**，固定使用官方 **sing-box 1.14.4**，支持 Debian/Ubuntu、systemd、Linux x86_64 / aarch64。安装器自动补充依赖，核心下载须通过内置 SHA-256 校验。
+版本 **1.1.0**，固定使用官方 **sing-box 1.14.4**，支持 Debian/Ubuntu、systemd、Linux x86_64 / aarch64。安装器自动补充依赖，核心下载须通过内置 SHA-256 校验。
+
+1.1.0 新增交互菜单、独立多节点、终端二维码和 PNG 二维码。已有 1.0.x 节点自动作为 `default` 使用，更新脚本即可管理，**无需重新安装，不会自动更改现有密码、证书或服务**。
 
 1.0.1 修复了 systemd 地址族白名单遗漏 `AF_NETLINK` 导致的 `initialize network: create netlink socket: address family not supported by protocol` 启动错误。1.0.0 若已自动回滚，重新下载本脚本并安装即可。启动失败时会先输出状态与 journal，并将诊断日志保存到 `/root/anytls-v6v4-failure-*.log`，再清理本次新建服务。
 
@@ -17,6 +19,76 @@ AnyTLS 入站 [VPS IPv6]:38445
 **IPv4-only 是严格限制：**使用 `ipv4_only`，直接请求 IPv6 目标会被路由规则拒绝；仅有 AAAA 记录的站点访问失败。客户端不要把目标域名预先解析为 IPv6，应交给服务端解析。服务器回复客户端的数据仍通过原 IPv6 连接返回，这是 IPv6 入站的正常行为。“IPv4 出站”指此代理服务连接目标站点与 DNS 上游的流量；服务器其他进程的网络配置不受影响。
 
 AnyTLS 使用 TLS、分包与填充，旨在缓解嵌套 TLS 握手特征；仍可能受到 IP、SNI、流量分析或主动探测等因素影响。自签证书和高端口不等于普通网站伪装。见 [AnyTLS 官方项目](https://github.com/anytls/anytls-go)、[sing-box AnyTLS 入站](https://sing-box.sagernet.org/configuration/inbound/anytls/)。
+
+## 已安装用户：更新管理脚本并进入菜单
+
+以 root 执行：
+
+```bash
+curl -4fSL --retry 3 https://raw.githubusercontent.com/zbklk/sb/main/anytls-v6in-v4out/install.sh -o /root/anytls-v6v4-install.sh && bash /root/anytls-v6v4-install.sh menu
+```
+
+以后无参数运行 `bash /root/anytls-v6v4-install.sh` 就会显示菜单：
+
+```text
+1) 安装默认节点
+2) 列出节点
+3) 添加独立节点
+4) 节点二维码/导入链接
+5) 查看节点配置
+6) 节点完整自检
+7) 节点状态
+8) 备份节点
+9) 卸载指定节点
+0) 退出
+```
+
+已有节点选菜单 **4**，节点 ID 直接回车使用 `default`。菜单 **3** 添加新节点，例如 `phone2`，可填写中文显示名称和新端口。每个节点独立运行 sing-box，拥有独立的端口、随机密码、证书、目录和 systemd 服务，会增加相应的内存和磁盘占用；添加或卸载一个节点不会重启其他节点。
+
+## 扫码添加与二维码导出
+
+菜单 **4** 提供两种明确区分的方式：
+
+| 模式 | 客户端行为 | 使用条件 |
+| --- | --- | --- |
+| 1：严格证书校验 | URI 含 `insecure=0`，验证服务器证书 | 公开 CA 证书可直接导入；自签证书需客户端先显式信任 `server.crt` |
+| 2：自签兼容扫码 | URI 含 `insecure=1`，关闭客户端 TLS 证书身份校验 | 方便支持 AnyTLS 的客户端扫码连接自签节点；不能验证服务器身份 |
+
+标准 AnyTLS URI 只携带服务器、密码、SNI 等基本参数，**无法携带自签证书信任链**。因此不能承诺“严格模式扫描一次，就自动信任自签证书”。需要保留验证又想直接扫码时，请使用自有域名的公开 CA 证书模式。URI 格式见 [AnyTLS 官方规范](https://github.com/anytls/anytls-go/blob/main/docs/uri_scheme.md)。
+
+无需菜单也能执行：
+
+```bash
+# 默认严格校验
+bash /root/anytls-v6v4-install.sh qr --node default
+
+# 明确选择自签兼容扫码，关闭此导入链接中的客户端证书校验
+bash /root/anytls-v6v4-install.sh qr --node default --allow-insecure
+```
+
+首次生成二维码时会自动安装 `qrencode`。终端会同时显示链接和二维码，并保存 `/etc/anytls-v6v4/qr-strict.png` 或 `qr-insecure.png`，权限为 600；可以通过 SFTP 私下下载图片供手机扫描。生成兼容二维码不会更改服务端或原有 `client.json` 的校验设置。
+
+手机客户端需要实际支持 AnyTLS 及其 URI 格式。二维码、PNG 和链接都包含密码，请勿公开分享。
+
+## 后续增加节点
+
+```bash
+bash /root/anytls-v6v4-install.sh add --node phone2 --name '手机备用' --port 38446
+bash /root/anytls-v6v4-install.sh list
+bash /root/anytls-v6v4-install.sh qr --node phone2 --allow-insecure
+bash /root/anytls-v6v4-install.sh test --node phone2
+bash /root/anytls-v6v4-install.sh backup --node phone2
+bash /root/anytls-v6v4-install.sh uninstall --node phone2 --yes
+```
+
+节点 ID 须为 1–20 位小写字母/数字/中间连字符；显示名称支持中文。`add` 不指定端口时，会建议高于已有节点端口的新端口；若被其他进程占用，安装会拒绝启动，请使用 `--port` 改选。每个新增端口都需要在 IPv6 防火墙和安全组放通 TCP。
+
+| 节点 | 配置目录 | 服务 |
+| --- | --- | --- |
+| `default`（兼容原节点） | `/etc/anytls-v6v4/` | `anytls-v6v4.service` |
+| `phone2` | `/etc/anytls-v6v4-phone2/` | `anytls-v6v4-phone2.service` |
+
+核心分别位于 `/opt/anytls-v6v4[-节点ID]/sing-box`。新增节点也可使用 `--ipv6`、`--ipv4` 和证书参数；每个节点仍严格使用 IPv6 入站、IPv4 出站。这是在同一 VPS 上增加不同端口的节点，通常使用同一公网出口；如需增加其他 VPS，请到相应 VPS 运行脚本，本菜单不远程控制其他服务器。
 
 ## 一键安装
 
@@ -54,7 +126,7 @@ bash /root/anytls-v6v4-install.sh install \
 
 `443` 是可选端口，必须未被其他服务占用。即使使用域名证书，生成的客户端服务器地址仍是 VPS IPv6，SNI/证书校验名称才是域名。脚本不申请 ACME 证书，不开放 80，不设置自动续期。若用 DNS 获取证书，公网入口域名可只设 AAAA；这里使用直接 IPv6 连接也无需客户端解析入口域名。
 
-公开 CA 证书模式会额外生成 `anytls://` 链接，包含 IPv6、端口、随机密码和 SNI。脚本会通过真实握手验证证书链是否被核心信任；不能验证的证书会导致安装失败。不要把自签证书当作公开 CA 证书传入此模式。
+公开 CA 证书模式会额外生成 `anytls://` 链接，包含 IPv6、端口、随机密码和 SNI，可通过菜单或 `qr` 生成严格模式二维码。脚本会通过真实握手验证证书链是否被核心信任；不能验证的证书会导致安装失败。不要把自签证书当作公开 CA 证书传入此模式。
 
 ## 防火墙与端口
 
@@ -88,7 +160,7 @@ bash /root/anytls-v6v4-install.sh show
 
 **公开 CA 证书模式：**使用支持 AnyTLS 的客户端导入 `anytls://` 链接，或手工填写 AnyTLS、VPS IPv6、端口、密码、SNI，保持证书校验启用。不同客户端对 URI 支持不同，以实际字段为准。
 
-Shadowrocket 等手机客户端须在当前版本中明确支持 AnyTLS；不要假定旧版支持。若客户端无法显式信任自签证书，改用公开 CA 证书模式。自签模式不输出要求跳过证书校验的 URI。
+Shadowrocket 等手机客户端须在当前版本中明确支持 AnyTLS；不要假定旧版支持。若客户端无法显式信任自签证书，可使用公开 CA 证书模式，或明确选择菜单中的自签兼容扫码。`client.json` 始终保留证书校验；兼容二维码只改变该导入链接的客户端校验选项。
 
 完整 sing-box 示例在电脑运行后可测试：
 
@@ -143,8 +215,10 @@ bash /root/anytls-v6v4-install.sh install
 
 卸载前会自动备份，仅移除此 AnyTLS 的服务、配置与核心，保留系统账户和备份。现有 VLESS/SS2022 节点可继续使用。
 
+以上未指定 `--node` 的示例均针对 `default`；其他节点的管理命令需添加 `--node ID`，证书路径、服务名和文件属组也需换成该节点对应名称。更换证书/密码后请重新生成二维码，旧图片中的凭据不会自动更新。
+
 ## 自动化验证
 
-[GitHub Actions](../.github/workflows/anytls-v6v4.yml) 检查 Bash 语法、ShellCheck、证书名称预检、官方核心配置兼容性，以及真正的本地 AnyTLS 连接：IPv6 监听、IPv4 TCP/UDP 目标、双栈域名只查询 A、AAAA-only 失败、IPv6 TCP/UDP 字面量被拒绝、错误密码/不可信证书被拒绝。另在 Linux 上以独立非 root 账户实际启动生成的 systemd 服务，在完整服务限制下验证 IPv6 TLS 握手，覆盖 `AF_NETLINK` 初始化回归。测试使用临时回环套接字和临时服务，不部署到 VPS。
+[GitHub Actions](../.github/workflows/anytls-v6v4.yml) 检查 Bash 语法、ShellCheck、证书名称预检、官方核心配置兼容性，以及真正的本地 AnyTLS 连接：IPv6 监听、IPv4 TCP/UDP 目标、双栈域名只查询 A、AAAA-only 失败、IPv6 TCP/UDP 字面量被拒绝、错误密码/不可信证书被拒绝。另验证旧节点路径兼容、多节点隔离、单节点卸载、菜单错误恢复、URI 转义，并用 `zbarimg` 独立解码严格/兼容两种 PNG 二维码，核对完整链接。在 Linux 上以独立非 root 账户实际启动生成的 systemd 服务，在完整服务限制下验证 IPv6 TLS 握手，覆盖 `AF_NETLINK` 初始化回归。测试使用临时回环套接字和临时服务，不部署到 VPS。
 
 实际 VPS 部署仍需在你的服务器执行上述安装命令，并完成客户端公网 IPv6 实测。
