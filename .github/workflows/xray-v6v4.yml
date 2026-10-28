@@ -1,0 +1,17 @@
+name: Xray IPv6 IPv4 installer checks
+on:
+  push:
+    paths:
+      - 'xray-v6in-v4out/**'
+      - '.github/workflows/xray-v6v4.yml'
+  pull_request:
+    paths:
+      - 'xray-v6in-v4out/**'
+      - '.github/workflows/xray-v6v4.yml'
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax and static regression tests
+        run: python3 xray-v6in-v4out/tests/test_static.py -v
