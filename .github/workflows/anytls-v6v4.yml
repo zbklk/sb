@@ -33,3 +33,5 @@ jobs:
           echo "SING_BOX=/tmp/sing-box-1.14.4-linux-amd64/sing-box" >> "$GITHUB_ENV"
       - name: Real AnyTLS IPv6 loopback, IPv4 DNS/egress, and TLS/authentication checks
         run: python3 -m unittest discover -s anytls-v6in-v4out/tests -v
+      - name: Start the actual generated systemd unit under its service sandbox
+        run: sudo env SING_BOX="$SING_BOX" RUN_SYSTEMD_TESTS=1 python3 -m unittest discover -s anytls-v6in-v4out/tests -p test_systemd.py -v

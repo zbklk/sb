@@ -1,6 +1,8 @@
 # AnyTLS：公网 IPv6 入站 → IPv4 出站
 
-版本 **1.0.0**，固定使用官方 **sing-box 1.14.4**，支持 Debian/Ubuntu、systemd、Linux x86_64 / aarch64。安装器自动补充依赖，核心下载须通过内置 SHA-256 校验。
+版本 **1.0.1**，固定使用官方 **sing-box 1.14.4**，支持 Debian/Ubuntu、systemd、Linux x86_64 / aarch64。安装器自动补充依赖，核心下载须通过内置 SHA-256 校验。
+
+1.0.1 修复了 systemd 地址族白名单遗漏 `AF_NETLINK` 导致的 `initialize network: create netlink socket: address family not supported by protocol` 启动错误。1.0.0 若已自动回滚，重新下载本脚本并安装即可。启动失败时会先输出状态与 journal，并将诊断日志保存到 `/root/anytls-v6v4-failure-*.log`，再清理本次新建服务。
 
 ```text
 支持 AnyTLS 的客户端（具有公网 IPv6 连通性）
@@ -143,6 +145,6 @@ bash /root/anytls-v6v4-install.sh install
 
 ## 自动化验证
 
-[GitHub Actions](../.github/workflows/anytls-v6v4.yml) 检查 Bash 语法、ShellCheck、证书名称预检、官方核心配置兼容性，以及真正的本地 AnyTLS 连接：IPv6 监听、IPv4 TCP/UDP 目标、双栈域名只查询 A、AAAA-only 失败、IPv6 TCP/UDP 字面量被拒绝、错误密码/不可信证书被拒绝。测试使用临时回环套接字，不部署到 VPS。
+[GitHub Actions](../.github/workflows/anytls-v6v4.yml) 检查 Bash 语法、ShellCheck、证书名称预检、官方核心配置兼容性，以及真正的本地 AnyTLS 连接：IPv6 监听、IPv4 TCP/UDP 目标、双栈域名只查询 A、AAAA-only 失败、IPv6 TCP/UDP 字面量被拒绝、错误密码/不可信证书被拒绝。另在 Linux 上以独立非 root 账户实际启动生成的 systemd 服务，在完整服务限制下验证 IPv6 TLS 握手，覆盖 `AF_NETLINK` 初始化回归。测试使用临时回环套接字和临时服务，不部署到 VPS。
 
 实际 VPS 部署仍需在你的服务器执行上述安装命令，并完成客户端公网 IPv6 实测。

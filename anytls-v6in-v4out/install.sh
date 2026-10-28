@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=1.0.0
+VERSION=1.0.1
 CORE_VERSION=1.14.4
 NAME=anytls-v6v4
 DIR=/etc/$NAME
@@ -166,13 +166,27 @@ ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# sing-box uses netlink to inspect network interfaces/routes during startup.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+save_failure_diagnostics() {
+  local report
+  report=$(mktemp "/root/anytls-v6v4-failure-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.log") || return 1
+  {
+    printf 'AnyTLS installer %s / sing-box %s\n' "$VERSION" "$CORE_VERSION"
+    systemctl --no-pager --full status "$SERVICE" || true
+    systemctl show "$SERVICE" -p Result -p ExecMainCode -p ExecMainStatus || true
+    journalctl -u "$SERVICE" -n 60 --no-pager || true
+  } > "$report" 2>&1
+  chmod 600 "$report"
+  cat "$report" >&2
+  printf '[诊断] 本次失败日志已保留：%s\n' "$report" >&2
 }
 do_install() (
   need_root
@@ -192,14 +206,15 @@ do_install() (
   # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap.
   cleanup() {
     local rc=$?
-    rm -rf -- "$stage"
     if (( rc != 0 && created == 1 )); then
+      save_failure_diagnostics || true
       systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
       rm -f -- "$UNIT"
       rm -rf -- "$DIR" "$BIN_DIR"
       systemctl daemon-reload >/dev/null 2>&1 || true
       printf '[错误] 安装失败，已清理本次 AnyTLS 服务。\n' >&2
     fi
+    rm -rf -- "$stage"
   }
   trap cleanup EXIT
   download_core "$stage"
@@ -302,7 +317,7 @@ do_uninstall() {
 }
 usage() {
   cat <<'HELP'
-AnyTLS IPv6-in / IPv4-out v1.0.0 (sing-box 1.14.4)
+AnyTLS IPv6-in / IPv4-out v1.0.1 (sing-box 1.14.4)
   bash install.sh install [--port 38445] [--ipv6 <public-v6>] [--ipv4 <local-v4>]
                           [--server-name node.example.com --cert /path/fullchain.pem --key /path/key.pem]
   bash install.sh show | status | test | backup
