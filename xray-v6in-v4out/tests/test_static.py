@@ -17,10 +17,19 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('diagnose',r.stdout)
         self.assertIn('selftest',r.stdout)
     def test_version(self):
-        self.assertIn('SCRIPT_VERSION=2.1.0',self.source)
+        self.assertIn('SCRIPT_VERSION=2.1.1',self.source)
     def test_client_pipeline(self):
         for feature in ('self_test() (', 'socks5h://127.0.0.1:', "'password':key", "'flow':'xtls-rprx-vision'", 'ForceIPv4'):
             self.assertIn(feature,self.source)
+    def test_extensionless_staged_config_is_explicit_json(self):
+        # Xray's auto format relies on file extension, but .change.XXXXXXXX
+        # and .newconfig.XXXXXXXX staging files are extensionless.
+        self.assertIn('xray run -test -format json -config "$1"', self.source)
+        self.assertIn('mktemp "$DIR/.change.XXXXXXXX"', self.source)
+        self.assertIn('check_config "$tmp"', self.source)
+    def test_diagnostic_log_fields_are_supported(self):
+        self.assertIn("'maskAddress':'quarter'", self.source)
+        self.assertIn("'dnsLog':True", self.source)
     def test_dns_and_log_and_target(self):
         for feature in ('https+local://1.1.1.1/dns-query','maskAddress\':\'quarter','reality_probe()','choose_dns()','choose_log()'):
             self.assertIn(feature,self.source)
