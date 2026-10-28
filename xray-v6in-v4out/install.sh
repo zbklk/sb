@@ -20,7 +20,7 @@ YES=0
 ACTION=
 PORT_SET=0
 SNI_SET=0
-SCRIPT_VERSION=2.1.1
+SCRIPT_VERSION=2.1.2
 
 info() { printf '\033[32m[信息]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[提醒]\033[0m %s\n' "$*" >&2; }
@@ -287,7 +287,18 @@ PY
 # Xray defaults to format=auto and identifies configs by extension.
 # Our atomic staging files (.change.XXXX etc.) intentionally have no .json suffix.
 # Explicit JSON format is mandatory for both DNS/log changes and restores.
-check_config() { xray run -test -format json -config "$1" >/dev/null; }
+# Xray v26.10.21 validates the actual file extension in its external loader
+# even when -format json is specified. All staged configs must end in .json.
+# Preserve Xray's real error output on validation failure for troubleshooting.
+check_config() {
+  local output
+  if output="$(xray run -test -format json -config "$1" 2>&1)"; then
+    return 0
+  fi
+  warn 'Xray 配置校验的原始错误信息：'
+  printf '%s\n' "$output" >&2
+  return 1
+}
 check_installed() { exists || die '尚未完整安装；请先运行 install。'; }
 create_user() {
   [[ "$NAME" == 'xray-v6v4' ]] || die '内部服务名称异常，拒绝创建系统账户。'
@@ -437,7 +448,7 @@ change_port() {
   if [[ "$new" == "${C[2]}" ]]; then info '端口未变化。'; return 0; fi
   port_occupied "$new" && die "TCP $new 已被占用。"
   public=$(client_public)
-  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX")
+  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX.json")
   write_config "$tmp" "${C[0]}" "${C[1]}" "$new" "${C[3]}" "${C[4]}" "${C[5]}" "${C[6]}"
   apply_config "$tmp" "$public"
   rm -f "$tmp"
@@ -451,7 +462,7 @@ change_sni() {
   if [[ "$new" == "${C[6]}" ]]; then info 'SNI 未变化。'; return 0; fi
   reality_probe "$new" || warn '目标预检查未通过，仍允许修改，但建议执行完整代理自检'
   public=$(client_public)
-  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX")
+  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX.json")
   write_config "$tmp" "${C[0]}" "${C[1]}" "${C[2]}" "${C[3]}" "${C[4]}" "${C[5]}" "$new"
   apply_config "$tmp" "$public"
   rm -f "$tmp"
@@ -461,7 +472,7 @@ rotate_keys() {
   confirm '密钥与 UUID 都将更换，原客户端连接会失效，确定继续吗？' || { info '已取消。'; return 0; }
   keys
   local tmp
-  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX")
+  tmp=$(mktemp "$DIR/.newconfig.XXXXXXXX.json")
   write_config "$tmp" "${C[0]}" "${C[1]}" "${C[2]}" "$UUID" "$PRIVATE" "$SHORT" "${C[6]}"
   apply_config "$tmp" "$PUBLIC"
   rm -f "$tmp"
@@ -707,7 +718,7 @@ full_diagnose() {
 update_config_field() {
   check_installed
   local mode=$1 value=$2 tmp prev
-  tmp=$(mktemp "$DIR/.change.XXXXXXXX") || die '无法创建配置暂存文件'
+  tmp=$(mktemp "$DIR/.change.XXXXXXXX.json") || die '无法创建配置暂存文件'
   python3 - "$CONF" "$tmp" "$mode" "$value" <<'PY'
 import json,sys
 src,dst,mode,value=sys.argv[1:]
